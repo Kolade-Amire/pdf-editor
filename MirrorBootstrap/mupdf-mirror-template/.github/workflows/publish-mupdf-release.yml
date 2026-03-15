@@ -19,22 +19,22 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Refresh flattened mirror
-        shell: zsh
+        shell: bash
         run: ./Scripts/update-mupdf.sh "${{ inputs.upstream_ref }}"
 
       - name: Build MuPDF artifacts
-        shell: zsh
+        shell: bash
         run: ./Scripts/build-mupdf.sh
 
       - name: Package release artifacts
         id: package
-        shell: zsh
+        shell: bash
         run: ./Scripts/package-release.sh
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: zsh
+        shell: bash
         run: |
           release_tag="${{ steps.package.outputs.release_tag }}"
           gh release view "${release_tag}" >/dev/null 2>&1 && {
