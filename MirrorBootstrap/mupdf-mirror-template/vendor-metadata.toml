@@ -1,0 +1,8 @@
+schema_version = 1
+upstream_repo = "https://github.com/ArtifexSoftware/mupdf.git"
+upstream_commit = "d237b318e7b6e9e2c0c295f43a60910c8241ed78"
+import_strategy = "flattened-mirror"
+submodules_expanded = true
+submodule_note = "MuPDF upstream Git submodules are expanded into the committed mirror tree for reproducible releases."
+build_extract = "no"
+build_tesseract = "no"

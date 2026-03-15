@@ -1,0 +1,23 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+Vendor/mupdf/build/
+Vendor/mupdf/source-cache/
+MirrorBootstrap/mupdf-mirror-template/build/
+MirrorBootstrap/mupdf-mirror-template/dist/
+
+# Xcode local state
+DerivedData/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcuserdatad/
+*.xcuserstate
+
+# macOS filesystem noise
+.DS_Store
+
+# Editor swap/backup files
+*.swp
+*.swo
+*~

@@ -1,0 +1,49 @@
+name: Publish MuPDF Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream MuPDF commit, tag, or branch"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: macos-14
+    steps:
+      - name: Check out mirror repo
+        uses: actions/checkout@v4
+
+      - name: Refresh flattened mirror
+        shell: zsh
+        run: ./Scripts/update-mupdf.sh "${{ inputs.upstream_ref }}"
+
+      - name: Build MuPDF artifacts
+        shell: zsh
+        run: ./Scripts/build-mupdf.sh
+
+      - name: Package release artifacts
+        id: package
+        shell: zsh
+        run: ./Scripts/package-release.sh
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: zsh
+        run: |
+          release_tag="${{ steps.package.outputs.release_tag }}"
+          gh release view "${release_tag}" >/dev/null 2>&1 && {
+            echo "Release ${release_tag} already exists." >&2
+            exit 1
+          }
+          gh release create "${release_tag}" \
+            "${{ steps.package.outputs.source_archive }}" \
+            "${{ steps.package.outputs.build_archive }}" \
+            "${{ steps.package.outputs.checksum_file }}" \
+            --title "${release_tag}" \
+            --notes "Manual MuPDF mirror publish for ${release_tag}."
