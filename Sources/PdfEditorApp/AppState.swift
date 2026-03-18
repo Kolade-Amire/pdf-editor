@@ -6,8 +6,15 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class AppState: ObservableObject {
+    struct OverlaySaveRequest: Identifiable {
+        let id = UUID()
+        let destinationURL: URL?
+        let report: SavePreflightReport
+    }
+
     @Published var session: DocumentSession
     @Published var errorMessage: String?
+    @Published var overlaySaveRequest: OverlaySaveRequest?
 
     init(session: DocumentSession = DocumentSession()) {
         self.session = session
@@ -35,11 +42,7 @@ final class AppState: ObservableObject {
     }
 
     func saveDocument() {
-        do {
-            _ = try session.save()
-        } catch {
-            errorMessage = error.localizedDescription
-        }
+        attemptSave(to: nil)
     }
 
     func saveDocumentAs() {
@@ -52,16 +55,51 @@ final class AppState: ObservableObject {
             return
         }
 
-        do {
-            _ = try session.save(to: url)
-        } catch {
-            errorMessage = error.localizedDescription
-        }
+        attemptSave(to: url)
     }
 
     func unlockDocument(with password: String) {
         do {
             try session.unlock(with: password)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func confirmOverlaySave() {
+        guard let overlaySaveRequest else {
+            return
+        }
+
+        do {
+            _ = try session.save(to: overlaySaveRequest.destinationURL, allowOverlayFallback: true)
+            self.overlaySaveRequest = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func cancelOverlaySave() {
+        overlaySaveRequest = nil
+    }
+
+    private func attemptSave(to url: URL?) {
+        do {
+            let report = try session.prepareSave(to: url)
+            if report.blockedCount > 0 {
+                errorMessage = report.blockOutcomes
+                    .filter { $0.mode == .blocked }
+                    .map(\.message)
+                    .joined(separator: "\n")
+                return
+            }
+
+            if report.requiresOverlayConfirmation {
+                overlaySaveRequest = OverlaySaveRequest(destinationURL: url, report: report)
+                return
+            }
+
+            _ = try session.save(to: url, allowOverlayFallback: false)
         } catch {
             errorMessage = error.localizedDescription
         }

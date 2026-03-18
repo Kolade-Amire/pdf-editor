@@ -11,6 +11,7 @@ public final class DocumentSession: ObservableObject {
     @Published public private(set) var selectedRunID: String?
     @Published public private(set) var statusMessage: String?
     @Published public private(set) var lastValidationReport: ValidationReport?
+    @Published public private(set) var pendingSavePreflight: SavePreflightReport?
     @Published public private(set) var isReadOnly = true
     @Published public private(set) var requiresPassword = false
     @Published public var currentPageIndex = 0
@@ -88,6 +89,7 @@ public final class DocumentSession: ObservableObject {
         selectedRunID = nil
         draftText = ""
         lastValidationReport = nil
+        pendingSavePreflight = nil
         statusMessage = nil
 
         if !requiresPassword {
@@ -180,6 +182,7 @@ public final class DocumentSession: ObservableObject {
             pendingEdits[block.id] = TextEdit(blockID: block.id, replacementText: text)
         }
 
+        pendingSavePreflight = nil
         stagePendingEdits()
         refreshPageBlocksIfPossible(pageIndex: block.pageIndex)
     }
@@ -191,29 +194,74 @@ public final class DocumentSession: ObservableObject {
 
         pendingEdits.removeValue(forKey: block.id)
         draftText = block.originalText
+        pendingSavePreflight = nil
         stagePendingEdits()
         refreshPageBlocksIfPossible(pageIndex: block.pageIndex)
     }
 
+    public func prepareSave(to url: URL? = nil) throws -> SavePreflightReport {
+        guard let document else {
+            throw PDFEditorError.missingDocument
+        }
+
+        _ = url ?? document.descriptor.sourceURL
+        try validatePendingEdits()
+        try engine.applyEdits(Array(pendingEdits.values), to: document)
+
+        let report = try engine.preflightSave(Array(pendingEdits.values), for: document)
+        pendingSavePreflight = report
+
+        if report.blockedCount > 0 {
+            statusMessage = report.blockOutcomes
+                .filter { $0.mode == .blocked }
+                .map(\.message)
+                .joined(separator: " ")
+        } else if report.requiresOverlayConfirmation {
+            statusMessage = "Overlay fallback confirmation is required before save."
+        } else {
+            statusMessage = "Ready to save with true PDF rewriting."
+        }
+
+        return report
+    }
+
     @discardableResult
-    public func save(to url: URL? = nil) throws -> SaveResult {
+    public func save(to url: URL? = nil, allowOverlayFallback: Bool = false) throws -> SaveResult {
         guard let document else {
             throw PDFEditorError.missingDocument
         }
 
         let destinationURL = url ?? document.descriptor.sourceURL
-        try validatePendingEdits()
-        try engine.applyEdits(Array(pendingEdits.values), to: document)
+        let preflight = try prepareSave(to: destinationURL)
+        if preflight.blockedCount > 0 {
+            throw PDFEditorError.saveFailed(
+                preflight.blockOutcomes
+                    .filter { $0.mode == .blocked }
+                    .map(\.message)
+                    .joined(separator: " ")
+            )
+        }
+        if preflight.requiresOverlayConfirmation && !allowOverlayFallback {
+            throw PDFEditorError.saveFailed("One or more edits require overlay fallback confirmation before save.")
+        }
 
-        let result = try engine.save(document, to: destinationURL, mode: .automatic)
+        let result = try engine.save(
+            document,
+            to: destinationURL,
+            mode: .automatic,
+            allowOverlayFallback: allowOverlayFallback
+        )
         lastValidationReport = result.validationReport
         pendingEdits = [:]
         selectedBlockID = nil
         selectedRunID = nil
         draftText = ""
-        statusMessage = result.validationReport.isValid
-            ? "Saved \(result.fileURL.lastPathComponent)."
-            : "Saved with validation warnings."
+        pendingSavePreflight = nil
+        if result.validationReport.isValid {
+            statusMessage = "Saved \(result.fileURL.lastPathComponent): \(result.trueRewriteCount) true edit(s), \(result.overlayFallbackCount) overlay fallback edit(s)."
+        } else {
+            statusMessage = "Saved with validation warnings: \(result.trueRewriteCount) true edit(s), \(result.overlayFallbackCount) overlay fallback edit(s)."
+        }
 
         try load(url: destinationURL)
         lastValidationReport = result.validationReport

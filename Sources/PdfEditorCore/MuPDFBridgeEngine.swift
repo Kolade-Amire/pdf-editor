@@ -218,7 +218,78 @@ public final class MuPDFBridgeEngine: PDFEngine {
         storage.pendingEditsByBlockID = normalizedEdits
     }
 
-    public func save(_ document: LoadedPDFDocument, to url: URL, mode: SaveMode) throws -> SaveResult {
+    public func preflightSave(_ edits: [TextEdit], for document: LoadedPDFDocument) throws -> SavePreflightReport {
+        let storage = try storage(for: document)
+
+        guard document.descriptor.backend.supportsWrites else {
+            throw PDFEditorError.readOnly("This PDF is currently read-only and cannot be saved through MuPDF.")
+        }
+
+        let sortedEdits = try edits.sorted { lhs, rhs in
+            let left = try nativeReference(for: lhs.blockID, in: storage, document: document)
+            let right = try nativeReference(for: rhs.blockID, in: storage, document: document)
+            if left.pageIndex != right.pageIndex {
+                return left.pageIndex < right.pageIndex
+            }
+            return left.nativeBlockID < right.nativeBlockID
+        }
+
+        var nativeStrings: [UnsafeMutablePointer<CChar>?] = []
+        nativeStrings.reserveCapacity(sortedEdits.count)
+        for edit in sortedEdits {
+            guard let duplicated = strdup(edit.replacementText) else {
+                nativeStrings.forEach { free($0) }
+                throw PDFEditorError.saveFailed("Out of memory while preparing replacement text for save preflight.")
+            }
+            nativeStrings.append(duplicated)
+        }
+        defer { nativeStrings.forEach { free($0) } }
+
+        var nativeEdits: [pdf_bridge_text_edit] = []
+        nativeEdits.reserveCapacity(sortedEdits.count)
+        for (index, edit) in sortedEdits.enumerated() {
+            let reference = try nativeReference(for: edit.blockID, in: storage, document: document)
+            nativeEdits.append(
+                pdf_bridge_text_edit(
+                    page_index: Int32(reference.pageIndex),
+                    native_block_id: reference.nativeBlockID,
+                    replacement_text: nativeStrings[index]
+                )
+            )
+        }
+
+        var report = pdf_bridge_save_preflight_report()
+        var errorMessage: UnsafeMutablePointer<CChar>?
+
+        let didPreflight = nativeEdits.withUnsafeBufferPointer { buffer in
+            pdf_bridge_preflight_save(
+                storage.handle,
+                buffer.baseAddress,
+                buffer.count,
+                &report,
+                &errorMessage
+            ) != 0
+        }
+
+        guard didPreflight else {
+            defer { pdf_bridge_free_save_preflight_report(&report) }
+            throw bridgeError(
+                errorMessage,
+                fallback: "MuPDF could not prepare a save preflight report.",
+                defaultError: .saveFailed("MuPDF could not prepare a save preflight report.")
+            )
+        }
+
+        defer { pdf_bridge_free_save_preflight_report(&report) }
+        return mapSavePreflightReport(report)
+    }
+
+    public func save(
+        _ document: LoadedPDFDocument,
+        to url: URL,
+        mode: SaveMode,
+        allowOverlayFallback: Bool
+    ) throws -> SaveResult {
         let storage = try storage(for: document)
 
         guard document.descriptor.backend.supportsWrites else {
@@ -272,6 +343,7 @@ public final class MuPDFBridgeEngine: PDFEngine {
                 buffer.baseAddress,
                 buffer.count,
                 requestedMode,
+                allowOverlayFallback,
                 &saveResult,
                 &errorMessage
             ) != 0
@@ -298,6 +370,7 @@ public final class MuPDFBridgeEngine: PDFEngine {
             fileURL: url,
             usedSaveMode: mapSaveMode(saveResult.used_save_mode),
             appliedEditCount: Int(saveResult.applied_edit_count),
+            savedBlockOutcomes: bufferPointer(start: saveResult.outcomes, count: Int(saveResult.outcome_count)).map(mapSavedBlockOutcome),
             validationReport: validation
         )
     }
@@ -436,7 +509,9 @@ public final class MuPDFBridgeEngine: PDFEngine {
             lineFragments: block.lineFragments,
             isEditable: block.isEditable,
             failureReason: block.failureReason,
-            fallbackPlan: block.fallbackPlan
+            fallbackPlan: block.fallbackPlan,
+            persistenceMode: block.persistenceMode,
+            persistenceMessage: block.persistenceMessage
         )
     }
 
@@ -531,7 +606,9 @@ public final class MuPDFBridgeEngine: PDFEngine {
                 lineFragments: lineFragments,
                 isEditable: nativeBlock.is_editable,
                 failureReason: failureReason,
-                fallbackPlan: mapFallbackPlan(nativeBlock.fallback_plan)
+                fallbackPlan: mapFallbackPlan(nativeBlock.fallback_plan),
+                persistenceMode: mapPersistenceMode(nativeBlock.persistence_mode),
+                persistenceMessage: string(from: nativeBlock.persistence_message)
             )
 
             storage.blockReferencesByID[blockID] = NativeBlockReference(
@@ -549,6 +626,16 @@ public final class MuPDFBridgeEngine: PDFEngine {
             messages: bufferPointer(start: report.messages, count: Int(report.message_count)).compactMap {
                 guard let message = $0 else { return nil }
                 return String(cString: message)
+            }
+        )
+    }
+
+    private func mapSavePreflightReport(_ report: pdf_bridge_save_preflight_report) -> SavePreflightReport {
+        SavePreflightReport(
+            blockOutcomes: bufferPointer(start: report.outcomes, count: Int(report.outcome_count)).map(mapSavePreflightBlockOutcome),
+            warnings: bufferPointer(start: report.warnings, count: Int(report.warning_count)).compactMap {
+                guard let warning = $0 else { return nil }
+                return String(cString: warning)
             }
         )
     }
@@ -723,6 +810,37 @@ public final class MuPDFBridgeEngine: PDFEngine {
         default:
             return .systemBase14
         }
+    }
+
+    private func mapPersistenceMode(_ mode: pdf_bridge_persistence_mode) -> BlockPersistenceMode {
+        switch mode {
+        case PDF_BRIDGE_PERSISTENCE_MODE_TRUE_REWRITE:
+            return .trueRewrite
+        case PDF_BRIDGE_PERSISTENCE_MODE_OVERLAY_FALLBACK:
+            return .overlayFallback
+        case PDF_BRIDGE_PERSISTENCE_MODE_BLOCKED:
+            return .blocked
+        default:
+            return .blocked
+        }
+    }
+
+    private func mapSavePreflightBlockOutcome(_ outcome: pdf_bridge_block_outcome) -> SavePreflightBlockOutcome {
+        SavePreflightBlockOutcome(
+            blockID: makeBlockID(pageIndex: Int(outcome.page_index), nativeBlockID: outcome.native_block_id),
+            pageIndex: Int(outcome.page_index),
+            mode: mapPersistenceMode(outcome.mode),
+            message: string(from: outcome.message) ?? ""
+        )
+    }
+
+    private func mapSavedBlockOutcome(_ outcome: pdf_bridge_block_outcome) -> SavedBlockOutcome {
+        SavedBlockOutcome(
+            blockID: makeBlockID(pageIndex: Int(outcome.page_index), nativeBlockID: outcome.native_block_id),
+            pageIndex: Int(outcome.page_index),
+            mode: mapPersistenceMode(outcome.mode),
+            message: string(from: outcome.message) ?? ""
+        )
     }
 
     private func bridgeSaveMode(for mode: SaveMode) -> pdf_bridge_save_mode {

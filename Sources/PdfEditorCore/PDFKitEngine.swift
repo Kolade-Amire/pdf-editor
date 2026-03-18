@@ -120,7 +120,30 @@ public final class PDFKitEngine: PDFEngine {
         }
     }
 
-    public func save(_ document: LoadedPDFDocument, to url: URL, mode: SaveMode) throws -> SaveResult {
+    public func preflightSave(_ edits: [TextEdit], for document: LoadedPDFDocument) throws -> SavePreflightReport {
+        SavePreflightReport(
+            blockOutcomes: edits.map {
+                SavePreflightBlockOutcome(
+                    blockID: $0.blockID,
+                    pageIndex: 0,
+                    mode: .blocked,
+                    message: readOnlyReason
+                )
+            },
+            warnings: edits.isEmpty ? [] : [readOnlyReason]
+        )
+    }
+
+    public func save(
+        _ document: LoadedPDFDocument,
+        to url: URL,
+        mode: SaveMode,
+        allowOverlayFallback: Bool
+    ) throws -> SaveResult {
+        _ = document
+        _ = url
+        _ = mode
+        _ = allowOverlayFallback
         throw PDFEditorError.readOnly(readOnlyReason)
     }
 
@@ -286,7 +309,9 @@ public final class PDFKitEngine: PDFEngine {
                 lineFragments: [fragment],
                 isEditable: false,
                 failureReason: failureReason,
-                fallbackPlan: fallbackPlan
+                fallbackPlan: fallbackPlan,
+                persistenceMode: .blocked,
+                persistenceMessage: failureReason.message
             )
         }
     }
@@ -419,7 +444,22 @@ public final class PDFKitEngine: PDFEngine {
         throw PDFEditorError.unsupportedEngine("PDFKit is unavailable in this environment.")
     }
 
-    public func save(_ document: LoadedPDFDocument, to url: URL, mode: SaveMode) throws -> SaveResult {
+    public func preflightSave(_ edits: [TextEdit], for document: LoadedPDFDocument) throws -> SavePreflightReport {
+        _ = edits
+        _ = document
+        throw PDFEditorError.unsupportedEngine("PDFKit is unavailable in this environment.")
+    }
+
+    public func save(
+        _ document: LoadedPDFDocument,
+        to url: URL,
+        mode: SaveMode,
+        allowOverlayFallback: Bool
+    ) throws -> SaveResult {
+        _ = document
+        _ = url
+        _ = mode
+        _ = allowOverlayFallback
         throw PDFEditorError.unsupportedEngine("PDFKit is unavailable in this environment.")
     }
 

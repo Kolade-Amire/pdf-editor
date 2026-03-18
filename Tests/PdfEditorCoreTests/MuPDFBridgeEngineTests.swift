@@ -1,6 +1,7 @@
 #if canImport(AppKit)
 import AppKit
 import Foundation
+import PDFKit
 @testable import PdfEditorCore
 import XCTest
 
@@ -18,8 +19,12 @@ final class MuPDFBridgeEngineTests: XCTestCase {
         let savedURL = temporaryFileURL(named: "editable-saved")
 
         defer {
-            try? FileManager.default.removeItem(at: sourceURL)
-            try? FileManager.default.removeItem(at: savedURL)
+            if FileManager.default.fileExists(atPath: sourceURL.path) {
+                try? FileManager.default.removeItem(at: sourceURL)
+            }
+            if FileManager.default.fileExists(atPath: savedURL.path) {
+                try? FileManager.default.removeItem(at: savedURL)
+            }
         }
 
         let engine = MuPDFBridgeEngine(validationBinaryURL: nil)
@@ -38,7 +43,8 @@ final class MuPDFBridgeEngineTests: XCTestCase {
         XCTAssertTrue(editableBlock.originalText.contains("WWWW MMMM"))
 
         let replacement = "iiii llll"
-        try engine.applyEdits([TextEdit(blockID: editableBlock.id, replacementText: replacement)], to: document)
+        let edit = TextEdit(blockID: editableBlock.id, replacementText: replacement)
+        try engine.applyEdits([edit], to: document)
 
         let stagedBlocks = try engine.extractEditableBlocks(from: document, pageIndex: 0)
         XCTAssertEqual(
@@ -46,10 +52,16 @@ final class MuPDFBridgeEngineTests: XCTestCase {
             replacement
         )
 
-        let result = try engine.save(document, to: savedURL, mode: .automatic)
+        let preflight = try engine.preflightSave([edit], for: document)
+        XCTAssertEqual(preflight.trueRewriteCount, 1)
+        XCTAssertEqual(preflight.overlayFallbackCount, 0)
+        XCTAssertEqual(preflight.blockedCount, 0)
+
+        let result = try engine.save(document, to: savedURL, mode: .automatic, allowOverlayFallback: false)
         XCTAssertTrue(result.validationReport.isValid)
         XCTAssertGreaterThanOrEqual(result.appliedEditCount, 1)
-        XCTAssertFalse(result.validationReport.messages.isEmpty)
+        XCTAssertEqual(result.trueRewriteCount, 1)
+        XCTAssertEqual(result.overlayFallbackCount, 0)
 
         let reopenedDocument = try engine.open(url: savedURL)
         let reopenedBlocks = try engine.extractEditableBlocks(from: reopenedDocument, pageIndex: 0)
@@ -57,6 +69,15 @@ final class MuPDFBridgeEngineTests: XCTestCase {
             reopenedBlocks.contains(where: { $0.originalText.contains("iiii llll") }),
             "Saved PDF should reopen with replacement text discoverable through MuPDF extraction."
         )
+        XCTAssertFalse(
+            reopenedBlocks.contains(where: { $0.originalText.contains("WWWW MMMM") }),
+            "True rewrite should remove the original text from MuPDF extraction."
+        )
+
+        let pdfKitDocument = try XCTUnwrap(PDFDocument(url: savedURL))
+        let extractedText = pdfKitDocument.string ?? ""
+        XCTAssertTrue(extractedText.contains("iiii llll"))
+        XCTAssertFalse(extractedText.contains("WWWW MMMM"))
     }
 
     func testExtractEditableMultiLineBlockAsSingleBlock() throws {
@@ -69,7 +90,11 @@ final class MuPDFBridgeEngineTests: XCTestCase {
             )
         }
 
-        defer { try? FileManager.default.removeItem(at: sourceURL) }
+        defer {
+            if FileManager.default.fileExists(atPath: sourceURL.path) {
+                try? FileManager.default.removeItem(at: sourceURL)
+            }
+        }
 
         let engine = MuPDFBridgeEngine(validationBinaryURL: nil)
         let document = try engine.open(url: sourceURL)
@@ -102,7 +127,11 @@ final class MuPDFBridgeEngineTests: XCTestCase {
             context.restoreGState()
         }
 
-        defer { try? FileManager.default.removeItem(at: sourceURL) }
+        defer {
+            if FileManager.default.fileExists(atPath: sourceURL.path) {
+                try? FileManager.default.removeItem(at: sourceURL)
+            }
+        }
 
         let engine = MuPDFBridgeEngine(validationBinaryURL: nil)
         let document = try engine.open(url: sourceURL)
@@ -127,7 +156,11 @@ final class MuPDFBridgeEngineTests: XCTestCase {
             NSBezierPath(rect: NSRect(x: 120, y: bounds.height - 260, width: 220, height: 120)).fill()
         }
 
-        defer { try? FileManager.default.removeItem(at: sourceURL) }
+        defer {
+            if FileManager.default.fileExists(atPath: sourceURL.path) {
+                try? FileManager.default.removeItem(at: sourceURL)
+            }
+        }
 
         let engine = MuPDFBridgeEngine(validationBinaryURL: nil)
         let document = try engine.open(url: sourceURL)
@@ -154,8 +187,12 @@ final class MuPDFBridgeEngineTests: XCTestCase {
         let destinationURL = temporaryFileURL(named: "encoding-saved")
 
         defer {
-            try? FileManager.default.removeItem(at: sourceURL)
-            try? FileManager.default.removeItem(at: destinationURL)
+            if FileManager.default.fileExists(atPath: sourceURL.path) {
+                try? FileManager.default.removeItem(at: sourceURL)
+            }
+            if FileManager.default.fileExists(atPath: destinationURL.path) {
+                try? FileManager.default.removeItem(at: destinationURL)
+            }
         }
 
         let engine = MuPDFBridgeEngine(validationBinaryURL: nil)
@@ -164,15 +201,27 @@ final class MuPDFBridgeEngineTests: XCTestCase {
             try engine.extractEditableBlocks(from: document, pageIndex: 0).first(where: { $0.isEditable })
         )
 
-        try engine.applyEdits([TextEdit(blockID: editableBlock.id, replacementText: "Encoding 😄 fixture")], to: document)
+        let edit = TextEdit(blockID: editableBlock.id, replacementText: "Encoding 😄 fixture")
+        try engine.applyEdits([edit], to: document)
 
-        XCTAssertThrowsError(try engine.save(document, to: destinationURL, mode: .automatic)) { error in
+        let preflight = try engine.preflightSave([edit], for: document)
+        XCTAssertEqual(preflight.blockedCount, 1)
+        XCTAssertEqual(preflight.overlayFallbackCount, 0)
+
+        XCTAssertThrowsError(
+            try engine.save(document, to: destinationURL, mode: .automatic, allowOverlayFallback: true)
+        ) { error in
             let message = error.localizedDescription.lowercased()
             XCTAssertTrue(
-                message.contains("cannot be encoded") || message.contains("could not save"),
+                message.contains("blocked") || message.contains("could not save"),
                 "Unexpected save failure: \(error.localizedDescription)"
             )
         }
+    }
+
+    func testMixedModeSaveRequiresOverlayApprovalAndReportsCounts() throws {
+        try requireMuPDF()
+        throw XCTSkip("Mixed-mode MuPDF fixture coverage is pending broader true-rewrite candidate matching.")
     }
 
     private func requireMuPDF() throws {

@@ -110,6 +110,8 @@ static void bridge_clear_text_block(pdf_bridge_text_block *block)
     block->fallback_plan.resolved_font_name = NULL;
     free(block->fallback_plan.warning);
     block->fallback_plan.warning = NULL;
+    free(block->persistence_message);
+    block->persistence_message = NULL;
 
     for (line_index = 0; line_index < block->line_count; line_index++) {
         bridge_free_line_fragment(&block->lines[line_index]);
@@ -201,6 +203,7 @@ int pdf_bridge_save_document(
     const pdf_bridge_text_edit *edits,
     size_t edit_count,
     pdf_bridge_save_mode requested_mode,
+    bool allow_overlay_fallback,
     pdf_bridge_save_result *out_result,
     char **out_error
 )
@@ -210,7 +213,23 @@ int pdf_bridge_save_document(
     (void)edits;
     (void)edit_count;
     (void)requested_mode;
+    (void)allow_overlay_fallback;
     (void)out_result;
+    return bridge_unavailable(out_error);
+}
+
+int pdf_bridge_preflight_save(
+    pdf_bridge_document *document,
+    const pdf_bridge_text_edit *edits,
+    size_t edit_count,
+    pdf_bridge_save_preflight_report *out_report,
+    char **out_error
+)
+{
+    (void)document;
+    (void)edits;
+    (void)edit_count;
+    (void)out_report;
     return bridge_unavailable(out_error);
 }
 
@@ -278,10 +297,62 @@ typedef struct {
 typedef struct {
     int32_t page_index;
     int32_t native_block_id;
+    char *original_text;
     const char *replacement_text;
+    pdf_bridge_persistence_mode mode;
+    char *message;
 } bridge_resolved_edit;
 
+typedef struct {
+    int32_t native_block_id;
+    pdf_bridge_rect bounds;
+    int matched_text_object_count;
+    bool touched_multiple_blocks;
+    bool current_touched;
+    bool current_candidate_match;
+    fz_rect current_bounds;
+    bool has_current_bounds;
+} bridge_text_object_probe_target;
+
+typedef struct {
+    bridge_text_object_probe_target *targets;
+    size_t target_count;
+    bool remove_matching_text;
+    fz_rect page_bounds;
+} bridge_text_object_probe_state;
+
+typedef struct {
+    int32_t native_block_id;
+    pdf_bridge_rect bounds;
+    const char *replacement_text;
+    bridge_block_analysis analysis;
+} bridge_page_edit_analysis;
+
+typedef struct {
+    char resource_name[16];
+    pdf_obj *font_reference;
+    fz_text *layout;
+    pdf_bridge_color color;
+    float font_size;
+    pdf_bridge_text_encoding encoding;
+} bridge_true_rewrite_append_spec;
+
+typedef struct {
+    fz_rect page_bounds;
+    bridge_true_rewrite_append_spec *items;
+    size_t count;
+} bridge_true_rewrite_complete_state;
+
 static const float bridge_line_height_em = 1.2f;
+static int bridge_compare_edits(const void *left, const void *right);
+static fz_stext_block *bridge_find_text_block_by_native_id(fz_stext_page *stext_page, int32_t native_block_id);
+static int bridge_select_font(
+    fz_context *ctx,
+    const bridge_block_analysis *analysis,
+    const char *replacement_text,
+    bridge_selected_font *out_font
+);
+static void bridge_drop_selected_font(fz_context *ctx, bridge_selected_font *font);
 
 static void bridge_set_mupdf_error(fz_context *ctx, char **out_error, const char *prefix)
 {
@@ -350,6 +421,13 @@ static void bridge_zero_validation_report(pdf_bridge_validation_report *report)
     }
 }
 
+static void bridge_zero_save_preflight_report(pdf_bridge_save_preflight_report *report)
+{
+    if (report != NULL) {
+        memset(report, 0, sizeof(*report));
+    }
+}
+
 static void bridge_zero_save_result(pdf_bridge_save_result *result)
 {
     if (result != NULL) {
@@ -370,6 +448,22 @@ static pdf_bridge_rect bridge_make_rect(fz_rect rect)
 static fz_rect bridge_to_fz_rect(pdf_bridge_rect rect)
 {
     return fz_make_rect(rect.x, rect.y, rect.x + rect.width, rect.y + rect.height);
+}
+
+static bool bridge_rect_contains_point(pdf_bridge_rect rect, fz_point point, float tolerance)
+{
+    return point.x >= rect.x - tolerance &&
+        point.x <= rect.x + rect.width + tolerance &&
+        point.y >= rect.y - tolerance &&
+        point.y <= rect.y + rect.height + tolerance;
+}
+
+static bool bridge_rect_approximately_matches(pdf_bridge_rect target, fz_rect candidate, float tolerance)
+{
+    return fabsf(candidate.x0 - (float)target.x) <= tolerance &&
+        fabsf(candidate.y0 - (float)target.y) <= tolerance &&
+        fabsf(candidate.x1 - (float)(target.x + target.width)) <= tolerance &&
+        fabsf(candidate.y1 - (float)(target.y + target.height)) <= tolerance;
 }
 
 static pdf_bridge_quad bridge_make_quad(fz_quad quad)
@@ -846,6 +940,124 @@ static pdf_bridge_font_plan bridge_make_font_plan(const bridge_block_analysis *a
     return plan;
 }
 
+static int bridge_find_probe_target_index(
+    bridge_text_object_probe_state *state,
+    fz_rect glyph_bounds
+)
+{
+    fz_point center;
+    int best_index = -1;
+    double best_area = 0.0;
+    size_t index;
+
+    center.x = (glyph_bounds.x0 + glyph_bounds.x1) * 0.5f;
+    center.y = (glyph_bounds.y0 + glyph_bounds.y1) * 0.5f;
+
+    for (index = 0; index < state->target_count; index++) {
+        pdf_bridge_rect target = state->targets[index].bounds;
+        double area;
+
+        if (!bridge_rect_contains_point(target, center, 1.5f)) {
+            continue;
+        }
+
+        area = target.width * target.height;
+        if (best_index < 0 || area < best_area) {
+            best_index = (int)index;
+            best_area = area;
+        }
+    }
+
+    return best_index;
+}
+
+static int bridge_probe_text_filter(
+    fz_context *ctx,
+    void *opaque,
+    int *ucsbuf,
+    int ucslen,
+    fz_matrix trm,
+    fz_matrix ctm,
+    fz_rect bbox,
+    int tr,
+    float ca,
+    float CA
+)
+{
+    bridge_text_object_probe_state *state = (bridge_text_object_probe_state *)opaque;
+    int target_index;
+
+    (void)ctx;
+    (void)ucsbuf;
+    (void)ucslen;
+    (void)tr;
+    (void)ca;
+    (void)CA;
+
+    bbox = fz_transform_rect(bbox, fz_concat(trm, ctm));
+    bbox = fz_transform_rect(
+        bbox,
+        (fz_matrix){ 1, 0, 0, -1, -state->page_bounds.x0, state->page_bounds.y1 }
+    );
+    target_index = bridge_find_probe_target_index(state, bbox);
+    if (target_index < 0) {
+        return 0;
+    }
+
+    state->targets[target_index].current_touched = true;
+    if (!state->targets[target_index].has_current_bounds) {
+        state->targets[target_index].current_bounds = bbox;
+        state->targets[target_index].has_current_bounds = true;
+    } else {
+        state->targets[target_index].current_bounds = fz_union_rect(state->targets[target_index].current_bounds, bbox);
+    }
+
+    return state->remove_matching_text ? 1 : 0;
+}
+
+static void bridge_probe_after_text_object(
+    fz_context *ctx,
+    void *opaque,
+    pdf_document *doc,
+    pdf_processor *chain,
+    fz_matrix ctm
+)
+{
+    bridge_text_object_probe_state *state = (bridge_text_object_probe_state *)opaque;
+    size_t index;
+    size_t touched_count = 0;
+
+    (void)ctx;
+    (void)doc;
+    (void)chain;
+    (void)ctm;
+
+    for (index = 0; index < state->target_count; index++) {
+        if (state->targets[index].current_touched) {
+            touched_count++;
+        }
+    }
+
+    for (index = 0; index < state->target_count; index++) {
+        if (!state->targets[index].current_touched) {
+            continue;
+        }
+
+        if (touched_count > 1) {
+            state->targets[index].touched_multiple_blocks = true;
+        }
+
+        if (state->targets[index].has_current_bounds &&
+            bridge_rect_approximately_matches(state->targets[index].bounds, state->targets[index].current_bounds, 3.0f)) {
+            state->targets[index].matched_text_object_count++;
+        }
+
+        state->targets[index].current_touched = false;
+        state->targets[index].has_current_bounds = false;
+        state->targets[index].current_bounds = fz_empty_rect;
+    }
+}
+
 static char *bridge_lookup_title(fz_context *ctx, fz_document *document)
 {
     char buffer[512];
@@ -1003,6 +1215,8 @@ static int bridge_collect_page_blocks(
                 page_index,
                 block->id
             );
+            bridged_block.persistence_mode = PDF_BRIDGE_PERSISTENCE_MODE_BLOCKED;
+            bridged_block.persistence_message = bridge_strdup(analysis.failure_message);
             pending_block = bridged_block;
 
             if (issue_count == issue_capacity) {
@@ -1025,6 +1239,15 @@ static int bridge_collect_page_blocks(
                 block->id
             );
         } else {
+            bridged_block.persistence_mode =
+                (line_index == 1)
+                ? PDF_BRIDGE_PERSISTENCE_MODE_TRUE_REWRITE
+                : PDF_BRIDGE_PERSISTENCE_MODE_OVERLAY_FALLBACK;
+            bridged_block.persistence_message = bridge_strdup(
+                bridged_block.persistence_mode == PDF_BRIDGE_PERSISTENCE_MODE_TRUE_REWRITE
+                    ? "This block is currently eligible for true PDF rewriting."
+                    : "This block may require overlay fallback when saved."
+            );
             page_has_editable_block = true;
         }
 
@@ -1614,6 +1837,140 @@ static void bridge_append_text(
     }
 }
 
+static void bridge_drop_true_rewrite_complete_state(
+    fz_context *ctx,
+    bridge_true_rewrite_complete_state *state
+)
+{
+    size_t index;
+
+    if (state == NULL) {
+        return;
+    }
+
+    for (index = 0; index < state->count; index++) {
+        if (state->items[index].font_reference != NULL) {
+            pdf_drop_obj(ctx, state->items[index].font_reference);
+        }
+        if (state->items[index].layout != NULL) {
+            fz_drop_text(ctx, state->items[index].layout);
+        }
+    }
+
+    free(state->items);
+    state->items = NULL;
+    state->count = 0;
+    state->page_bounds = fz_empty_rect;
+}
+
+static void bridge_complete_true_rewrite_buffer(fz_context *ctx, fz_buffer *buffer, void *opaque)
+{
+    bridge_true_rewrite_complete_state *state = (bridge_true_rewrite_complete_state *)opaque;
+    size_t index;
+
+    if (state == NULL || state->count == 0) {
+        return;
+    }
+
+    fz_append_string(ctx, buffer, "\nq\n");
+    bridge_append_page_transform(ctx, buffer, state->page_bounds);
+    for (index = 0; index < state->count; index++) {
+        if (state->items[index].layout == NULL || state->items[index].resource_name[0] == '\0') {
+            continue;
+        }
+        bridge_append_text_color(ctx, buffer, state->items[index].color);
+        bridge_append_text(
+            ctx,
+            buffer,
+            state->items[index].resource_name,
+            state->items[index].layout,
+            state->items[index].font_size,
+            state->items[index].encoding,
+            0.0,
+            1.0,
+            0.0
+        );
+    }
+    fz_append_string(ctx, buffer, "Q\n");
+}
+
+static int bridge_run_page_text_object_probe(
+    fz_context *ctx,
+    pdf_bridge_document *document,
+    pdf_page *page,
+    int32_t page_index,
+    bridge_text_object_probe_state *probe_state,
+    char **out_error
+)
+{
+    pdf_filter_options options;
+    pdf_sanitize_filter_options sanitize_options;
+    pdf_filter_factory filters[2];
+    pdf_processor *buffer_processor = NULL;
+    pdf_processor *sanitize_processor = NULL;
+    pdf_processor *top = NULL;
+    fz_buffer *buffer = NULL;
+    pdf_obj *resources;
+    pdf_obj *contents;
+    pdf_obj *new_resources = NULL;
+    pdf_obj *page_object = NULL;
+    int struct_parents;
+
+    memset(&options, 0, sizeof(options));
+    memset(&sanitize_options, 0, sizeof(sanitize_options));
+    memset(filters, 0, sizeof(filters));
+
+    sanitize_options.opaque = probe_state;
+    sanitize_options.text_filter = bridge_probe_text_filter;
+    sanitize_options.after_text_object = bridge_probe_after_text_object;
+
+    filters[0].filter = pdf_new_sanitize_filter;
+    filters[0].options = &sanitize_options;
+    options.filters = filters;
+    options.newlines = 0;
+
+    contents = pdf_page_contents(ctx, page);
+    resources = pdf_page_resources(ctx, page);
+    page_object = pdf_lookup_page_obj(ctx, document->pdf_document, page_index);
+    struct_parents = pdf_dict_get_int_default(ctx, page_object, PDF_NAME(StructParents), -1);
+
+    fz_try(ctx)
+    {
+        buffer = fz_new_buffer(ctx, 1024);
+        top = buffer_processor = pdf_new_buffer_processor(ctx, buffer, 0, 0);
+        top = sanitize_processor = pdf_new_sanitize_filter(
+            ctx,
+            document->pdf_document,
+            top,
+            struct_parents,
+            fz_identity,
+            &options,
+            &sanitize_options
+        );
+
+        pdf_process_contents(ctx, top, document->pdf_document, resources, contents, NULL, &new_resources);
+        pdf_close_processor(ctx, top);
+    }
+    fz_always(ctx)
+    {
+        pdf_drop_obj(ctx, new_resources);
+        fz_drop_buffer(ctx, buffer);
+        if (sanitize_processor != NULL) {
+            pdf_drop_processor(ctx, sanitize_processor);
+        }
+        if (buffer_processor != NULL) {
+            pdf_drop_processor(ctx, buffer_processor);
+        }
+    }
+    fz_catch(ctx)
+    {
+        bridge_set_mupdf_error(ctx, out_error, "Failed to inspect page text objects");
+        return 0;
+    }
+
+    return 1;
+}
+
 static pdf_obj *bridge_ensure_font_resource_dict(fz_context *ctx, pdf_document *document, pdf_obj *resources)
 {
     pdf_obj *fonts = pdf_dict_get(ctx, resources, PDF_NAME(Font));
@@ -1622,6 +1979,203 @@ static pdf_obj *bridge_ensure_font_resource_dict(fz_context *ctx, pdf_document *
         pdf_dict_put_drop(ctx, resources, PDF_NAME(Font), fonts);
     }
     return fonts;
+}
+
+static void bridge_make_unique_font_resource_name(
+    fz_context *ctx,
+    pdf_obj *font_dict,
+    char *buffer,
+    size_t buffer_size,
+    const char *prefix
+)
+{
+    int index = 0;
+    do {
+        fz_snprintf(buffer, buffer_size, "%s%d", prefix, index++);
+    } while (pdf_dict_gets(ctx, font_dict, buffer) != NULL);
+}
+
+static int bridge_apply_page_true_rewrite(
+    fz_context *ctx,
+    pdf_bridge_document *document,
+    int32_t page_index,
+    const bridge_resolved_edit *edits,
+    size_t edit_count,
+    char **out_error
+)
+{
+    pdf_page *page = NULL;
+    fz_stext_page *stext_page = NULL;
+    fz_stext_options text_options;
+    pdf_filter_options filter_options;
+    pdf_sanitize_filter_options sanitize_options;
+    pdf_filter_factory filters[2];
+    bridge_true_rewrite_complete_state complete_state;
+    bridge_text_object_probe_state probe_state;
+    bridge_text_object_probe_target *probe_targets = NULL;
+    pdf_obj *page_object = NULL;
+    pdf_obj *page_resources = NULL;
+    pdf_obj *font_dict = NULL;
+    size_t index;
+
+    memset(&complete_state, 0, sizeof(complete_state));
+    memset(&probe_state, 0, sizeof(probe_state));
+    memset(&filter_options, 0, sizeof(filter_options));
+    memset(&sanitize_options, 0, sizeof(sanitize_options));
+    memset(filters, 0, sizeof(filters));
+
+    if (edit_count == 0) {
+        return 1;
+    }
+
+    fz_init_stext_options(ctx, &text_options);
+    text_options.flags = FZ_STEXT_PRESERVE_SPANS | FZ_STEXT_CLIP | FZ_STEXT_ACCURATE_BBOXES | FZ_STEXT_COLLECT_STYLES;
+
+    complete_state.items = (bridge_true_rewrite_append_spec *)calloc(edit_count, sizeof(*complete_state.items));
+    probe_targets = (bridge_text_object_probe_target *)calloc(edit_count, sizeof(*probe_targets));
+    if (complete_state.items == NULL || probe_targets == NULL) {
+        bridge_set_error(out_error, "Out of memory while preparing true PDF rewrite content.");
+        goto fail;
+    }
+
+    page = pdf_load_page(ctx, document->pdf_document, page_index);
+    stext_page = fz_new_stext_page_from_page(ctx, (fz_page *)page, &text_options);
+    complete_state.page_bounds = fz_bound_page(ctx, (fz_page *)page);
+
+    page_object = pdf_lookup_page_obj(ctx, document->pdf_document, page_index);
+    pdf_flatten_inheritable_page_items(ctx, page_object);
+    page_resources = pdf_dict_get(ctx, page_object, PDF_NAME(Resources));
+    if (page_resources == NULL) {
+        page_resources = pdf_new_dict(ctx, document->pdf_document, 4);
+        pdf_dict_put_drop(ctx, page_object, PDF_NAME(Resources), page_resources);
+    }
+    font_dict = bridge_ensure_font_resource_dict(ctx, document->pdf_document, page_resources);
+
+    for (index = 0; index < edit_count; index++) {
+        fz_stext_block *block = bridge_find_text_block_by_native_id(stext_page, edits[index].native_block_id);
+        bridge_block_analysis analysis;
+        bridge_selected_font selected_font;
+
+        if (block == NULL) {
+            bridge_set_error(out_error, "The edited text block could not be found during true rewrite.");
+            goto fail;
+        }
+
+        analysis = bridge_analyze_text_block(ctx, document, block);
+        if (!analysis.is_editable) {
+            bridge_set_error(out_error, analysis.failure_message);
+            goto fail;
+        }
+
+        memset(&selected_font, 0, sizeof(selected_font));
+        if (!bridge_select_font(ctx, &analysis, edits[index].replacement_text, &selected_font)) {
+            bridge_set_error(out_error, "True rewrite could not encode the replacement text with the original font or Base14 fallback.");
+            goto fail;
+        }
+
+        if (!bridge_layout_text(
+                ctx,
+                selected_font.font ? selected_font.font : analysis.style.font,
+                analysis.style.font_size,
+                edits[index].replacement_text,
+                bridge_make_rect(block->bbox),
+                &complete_state.items[complete_state.count].layout,
+                out_error
+            )) {
+            bridge_drop_selected_font(ctx, &selected_font);
+            goto fail;
+        }
+
+        complete_state.items[complete_state.count].color = analysis.style.color;
+        complete_state.items[complete_state.count].font_size = analysis.style.font_size;
+        complete_state.items[complete_state.count].encoding = selected_font.encoding;
+        if (edits[index].replacement_text != NULL && edits[index].replacement_text[0] != '\0') {
+            bridge_make_unique_font_resource_name(
+                ctx,
+                font_dict,
+                complete_state.items[complete_state.count].resource_name,
+                sizeof(complete_state.items[complete_state.count].resource_name),
+                "TRW"
+            );
+            if (selected_font.mode == PDF_BRIDGE_FONT_MODE_ORIGINAL) {
+                complete_state.items[complete_state.count].font_reference = pdf_add_cid_font(
+                    ctx,
+                    document->pdf_document,
+                    analysis.style.font
+                );
+            } else {
+                int simple_encoding = PDF_SIMPLE_ENCODING_LATIN;
+                if (selected_font.encoding == PDF_BRIDGE_TEXT_ENCODING_GREEK) {
+                    simple_encoding = PDF_SIMPLE_ENCODING_GREEK;
+                } else if (selected_font.encoding == PDF_BRIDGE_TEXT_ENCODING_CYRILLIC) {
+                    simple_encoding = PDF_SIMPLE_ENCODING_CYRILLIC;
+                }
+                complete_state.items[complete_state.count].font_reference = pdf_add_simple_font(
+                    ctx,
+                    document->pdf_document,
+                    selected_font.font,
+                    simple_encoding
+                );
+            }
+        }
+        complete_state.count++;
+        bridge_drop_selected_font(ctx, &selected_font);
+
+        probe_targets[index].native_block_id = edits[index].native_block_id;
+        probe_targets[index].bounds = bridge_make_rect(block->bbox);
+    }
+
+    probe_state.targets = probe_targets;
+    probe_state.target_count = edit_count;
+    probe_state.remove_matching_text = true;
+    probe_state.page_bounds = complete_state.page_bounds;
+
+    sanitize_options.opaque = &probe_state;
+    sanitize_options.text_filter = bridge_probe_text_filter;
+    sanitize_options.after_text_object = bridge_probe_after_text_object;
+    filters[0].filter = pdf_new_sanitize_filter;
+    filters[0].options = &sanitize_options;
+    filter_options.filters = filters;
+    filter_options.opaque = &complete_state;
+    filter_options.complete = bridge_complete_true_rewrite_buffer;
+    filter_options.newlines = 0;
+
+    pdf_filter_page_contents(ctx, document->pdf_document, page, &filter_options);
+
+    page_object = pdf_lookup_page_obj(ctx, document->pdf_document, page_index);
+    page_resources = pdf_dict_get(ctx, page_object, PDF_NAME(Resources));
+    if (page_resources == NULL) {
+        page_resources = pdf_new_dict(ctx, document->pdf_document, 4);
+        pdf_dict_put_drop(ctx, page_object, PDF_NAME(Resources), page_resources);
+    }
+    font_dict = bridge_ensure_font_resource_dict(ctx, document->pdf_document, page_resources);
+
+    for (index = 0; index < complete_state.count; index++) {
+        if (complete_state.items[index].font_reference != NULL && complete_state.items[index].resource_name[0] != '\0') {
+            pdf_dict_puts(ctx, font_dict, complete_state.items[index].resource_name, complete_state.items[index].font_reference);
+        }
+    }
+
+    free(probe_targets);
+    bridge_drop_true_rewrite_complete_state(ctx, &complete_state);
+    if (stext_page != NULL) {
+        fz_drop_stext_page(ctx, stext_page);
+    }
+    if (page != NULL) {
+        pdf_drop_page(ctx, page);
+    }
+    return 1;
+
+fail:
+    free(probe_targets);
+    bridge_drop_true_rewrite_complete_state(ctx, &complete_state);
+    if (stext_page != NULL) {
+        fz_drop_stext_page(ctx, stext_page);
+    }
+    if (page != NULL) {
+        pdf_drop_page(ctx, page);
+    }
+    return 0;
 }
 
 static int bridge_select_font(
@@ -1672,6 +2226,227 @@ static void bridge_drop_selected_font(fz_context *ctx, bridge_selected_font *fon
         fz_drop_font(ctx, font->font);
     }
     memset(font, 0, sizeof(*font));
+}
+
+static void bridge_set_resolved_edit_message(bridge_resolved_edit *edit, const char *message)
+{
+    free(edit->message);
+    edit->message = bridge_strdup(message != NULL ? message : "");
+}
+
+static void bridge_clear_resolved_edits(bridge_resolved_edit *edits, size_t edit_count)
+{
+    size_t index;
+    if (edits == NULL) {
+        return;
+    }
+    for (index = 0; index < edit_count; index++) {
+        free(edits[index].original_text);
+        edits[index].original_text = NULL;
+        free(edits[index].message);
+        edits[index].message = NULL;
+    }
+}
+
+static fz_stext_block *bridge_find_text_block_by_native_id(fz_stext_page *stext_page, int32_t native_block_id)
+{
+    fz_stext_block *block;
+    for (block = stext_page->first_block; block != NULL; block = block->next) {
+        if (block->type == FZ_STEXT_BLOCK_TEXT && block->id == native_block_id) {
+            return block;
+        }
+    }
+    return NULL;
+}
+
+static int bridge_classify_page_edits(
+    fz_context *ctx,
+    pdf_bridge_document *document,
+    int32_t page_index,
+    bridge_resolved_edit *edits,
+    size_t edit_count,
+    char **out_error
+)
+{
+    pdf_page *page = NULL;
+    fz_stext_page *stext_page = NULL;
+    fz_stext_options options;
+    fz_stext_block **matched_blocks = NULL;
+    bridge_block_analysis *analyses = NULL;
+    bridge_text_object_probe_target *probe_targets = NULL;
+    int *probe_indices = NULL;
+    bridge_text_object_probe_state probe_state;
+    size_t probe_count = 0;
+    size_t index;
+
+    memset(&probe_state, 0, sizeof(probe_state));
+    fz_init_stext_options(ctx, &options);
+    options.flags = FZ_STEXT_PRESERVE_SPANS | FZ_STEXT_CLIP | FZ_STEXT_ACCURATE_BBOXES | FZ_STEXT_COLLECT_STYLES;
+
+    matched_blocks = (fz_stext_block **)calloc(edit_count == 0 ? 1 : edit_count, sizeof(*matched_blocks));
+    analyses = (bridge_block_analysis *)calloc(edit_count == 0 ? 1 : edit_count, sizeof(*analyses));
+    probe_targets = (bridge_text_object_probe_target *)calloc(edit_count == 0 ? 1 : edit_count, sizeof(*probe_targets));
+    probe_indices = (int *)calloc(edit_count == 0 ? 1 : edit_count, sizeof(*probe_indices));
+    if (matched_blocks == NULL || analyses == NULL || probe_targets == NULL || probe_indices == NULL) {
+        bridge_set_error(out_error, "Out of memory while classifying page edits.");
+        goto fail;
+    }
+
+    for (index = 0; index < edit_count; index++) {
+        probe_indices[index] = -1;
+        edits[index].mode = PDF_BRIDGE_PERSISTENCE_MODE_BLOCKED;
+        bridge_set_resolved_edit_message(&edits[index], "This block is not safe to save.");
+    }
+
+    page = pdf_load_page(ctx, document->pdf_document, page_index);
+    stext_page = fz_new_stext_page_from_page(ctx, (fz_page *)page, &options);
+
+    for (index = 0; index < edit_count; index++) {
+        fz_stext_block *block = bridge_find_text_block_by_native_id(stext_page, edits[index].native_block_id);
+        if (block == NULL) {
+            bridge_set_resolved_edit_message(&edits[index], "The edited text block could not be found during save preflight.");
+            continue;
+        }
+
+        matched_blocks[index] = block;
+        analyses[index] = bridge_analyze_text_block(ctx, document, block);
+        free(edits[index].original_text);
+        edits[index].original_text = bridge_normalize_text_from_block(ctx, block);
+        if (!analyses[index].is_editable) {
+            bridge_set_resolved_edit_message(&edits[index], analyses[index].failure_message);
+            continue;
+        }
+
+        probe_targets[probe_count].native_block_id = edits[index].native_block_id;
+        probe_targets[probe_count].bounds = bridge_make_rect(block->bbox);
+        probe_indices[index] = (int)probe_count;
+        probe_count++;
+    }
+
+    if (probe_count > 0) {
+        probe_state.targets = probe_targets;
+        probe_state.target_count = probe_count;
+        probe_state.remove_matching_text = false;
+        probe_state.page_bounds = fz_bound_page(ctx, (fz_page *)page);
+        if (!bridge_run_page_text_object_probe(ctx, document, page, page_index, &probe_state, out_error)) {
+            goto fail;
+        }
+    }
+
+    for (index = 0; index < edit_count; index++) {
+        bridge_selected_font selected_font;
+        fz_text *layout = NULL;
+        char *layout_error = NULL;
+        bool overlay_possible;
+        bool true_rewrite_possible = false;
+        int probe_index = probe_indices[index];
+
+        if (matched_blocks[index] == NULL || !analyses[index].is_editable) {
+            continue;
+        }
+
+        memset(&selected_font, 0, sizeof(selected_font));
+        overlay_possible =
+            bridge_select_font(ctx, &analyses[index], edits[index].replacement_text, &selected_font) &&
+            bridge_layout_text(
+                ctx,
+                selected_font.font ? selected_font.font : analyses[index].style.font,
+                analyses[index].style.font_size,
+                edits[index].replacement_text,
+                bridge_make_rect(matched_blocks[index]->bbox),
+                &layout,
+                &layout_error
+            );
+
+        if (overlay_possible &&
+            edits[index].original_text != NULL &&
+            strchr(edits[index].original_text, '\n') == NULL &&
+            (probe_index < 0 ||
+                (probe_targets[probe_index].matched_text_object_count <= 1 &&
+                 !probe_targets[probe_index].touched_multiple_blocks))) {
+            true_rewrite_possible = true;
+        }
+
+        if (layout != NULL) {
+            fz_drop_text(ctx, layout);
+        }
+        bridge_drop_selected_font(ctx, &selected_font);
+
+        if (true_rewrite_possible) {
+            edits[index].mode = PDF_BRIDGE_PERSISTENCE_MODE_TRUE_REWRITE;
+            bridge_set_resolved_edit_message(&edits[index], "This block will be saved as a true PDF edit.");
+        } else if (overlay_possible) {
+            edits[index].mode = PDF_BRIDGE_PERSISTENCE_MODE_OVERLAY_FALLBACK;
+            bridge_set_resolved_edit_message(
+                &edits[index],
+                "True rewrite is unavailable because the original text program could not be matched safely. Saving will use content overlay."
+            );
+        } else {
+            edits[index].mode = PDF_BRIDGE_PERSISTENCE_MODE_BLOCKED;
+            bridge_set_resolved_edit_message(
+                &edits[index],
+                layout_error != NULL ? layout_error : "Replacement text does not fit inside the original text block."
+            );
+        }
+
+        pdf_bridge_free_error(layout_error);
+    }
+
+    free(probe_indices);
+    free(probe_targets);
+    free(analyses);
+    free(matched_blocks);
+    fz_drop_stext_page(ctx, stext_page);
+    pdf_drop_page(ctx, page);
+    return 1;
+
+fail:
+    free(probe_indices);
+    free(probe_targets);
+    free(analyses);
+    free(matched_blocks);
+    if (stext_page != NULL) {
+        fz_drop_stext_page(ctx, stext_page);
+    }
+    if (page != NULL) {
+        pdf_drop_page(ctx, page);
+    }
+    return 0;
+}
+
+static int bridge_classify_edits(
+    fz_context *ctx,
+    pdf_bridge_document *document,
+    bridge_resolved_edit *resolved_edits,
+    size_t edit_count,
+    char **out_error
+)
+{
+    size_t page_start = 0;
+
+    qsort(resolved_edits, edit_count, sizeof(*resolved_edits), bridge_compare_edits);
+
+    while (page_start < edit_count) {
+        size_t page_end = page_start + 1;
+        while (page_end < edit_count && resolved_edits[page_end].page_index == resolved_edits[page_start].page_index) {
+            page_end++;
+        }
+
+        if (!bridge_classify_page_edits(
+                ctx,
+                document,
+                resolved_edits[page_start].page_index,
+                resolved_edits + page_start,
+                page_end - page_start,
+                out_error
+            )) {
+            return 0;
+        }
+
+        page_start = page_end;
+    }
+
+    return 1;
 }
 
 static int bridge_apply_page_overlay(
@@ -1890,6 +2665,52 @@ static int bridge_compare_edits(const void *left, const void *right)
     return 0;
 }
 
+static int bridge_fill_block_outcomes(
+    const bridge_resolved_edit *resolved_edits,
+    size_t edit_count,
+    pdf_bridge_block_outcome **out_outcomes,
+    int32_t *out_true_rewrite_count,
+    int32_t *out_overlay_fallback_count,
+    int32_t *out_blocked_count
+)
+{
+    pdf_bridge_block_outcome *outcomes = NULL;
+    size_t index;
+    int32_t true_rewrite_count = 0;
+    int32_t overlay_fallback_count = 0;
+    int32_t blocked_count = 0;
+
+    outcomes = (pdf_bridge_block_outcome *)calloc(edit_count == 0 ? 1 : edit_count, sizeof(*outcomes));
+    if (outcomes == NULL) {
+        return 0;
+    }
+
+    for (index = 0; index < edit_count; index++) {
+        outcomes[index].page_index = resolved_edits[index].page_index;
+        outcomes[index].native_block_id = resolved_edits[index].native_block_id;
+        outcomes[index].mode = resolved_edits[index].mode;
+        outcomes[index].message = bridge_strdup(resolved_edits[index].message != NULL ? resolved_edits[index].message : "");
+
+        switch (resolved_edits[index].mode) {
+        case PDF_BRIDGE_PERSISTENCE_MODE_TRUE_REWRITE:
+            true_rewrite_count++;
+            break;
+        case PDF_BRIDGE_PERSISTENCE_MODE_OVERLAY_FALLBACK:
+            overlay_fallback_count++;
+            break;
+        case PDF_BRIDGE_PERSISTENCE_MODE_BLOCKED:
+            blocked_count++;
+            break;
+        }
+    }
+
+    *out_outcomes = outcomes;
+    *out_true_rewrite_count = true_rewrite_count;
+    *out_overlay_fallback_count = overlay_fallback_count;
+    *out_blocked_count = blocked_count;
+    return 1;
+}
+
 static char *bridge_make_temporary_path(const char *destination_path)
 {
     const char *separator = strrchr(destination_path, '/');
@@ -1969,7 +2790,7 @@ static int bridge_validate_saved_edits(
     fz_init_stext_options(ctx, &options);
     options.flags = FZ_STEXT_PRESERVE_SPANS | FZ_STEXT_CLIP | FZ_STEXT_ACCURATE_BBOXES;
 
-    out_report->messages = (char **)calloc(edit_count + 1, sizeof(char *));
+    out_report->messages = (char **)calloc((edit_count * 2) + 2, sizeof(char *));
     if (out_report->messages == NULL) {
         pdf_bridge_close_document(document);
         return 0;
@@ -1986,13 +2807,23 @@ static int bridge_validate_saved_edits(
         {
             page_text = fz_new_buffer_from_page_number(ctx, document->document, edits[edit_index].page_index, &options);
             haystack = fz_string_from_buffer(ctx, page_text);
-            if (edits[edit_index].replacement_text != NULL &&
-                edits[edit_index].replacement_text[0] != '\0' &&
-                strstr(haystack, edits[edit_index].replacement_text) == NULL) {
-                out_report->is_valid = false;
-                out_report->messages[out_report->message_count++] = bridge_strdup("Saved file reopened, but one or more replacement strings were not discoverable in extracted page text.");
-                fz_drop_buffer(ctx, page_text);
-                break;
+            if (edits[edit_index].mode == PDF_BRIDGE_PERSISTENCE_MODE_TRUE_REWRITE) {
+                if (edits[edit_index].replacement_text != NULL &&
+                    edits[edit_index].replacement_text[0] != '\0' &&
+                    strstr(haystack, edits[edit_index].replacement_text) == NULL) {
+                    out_report->is_valid = false;
+                    out_report->messages[out_report->message_count++] = bridge_strdup("A true-rewrite block did not reopen with its replacement text present.");
+                    break;
+                }
+                if (edits[edit_index].original_text != NULL &&
+                    edits[edit_index].original_text[0] != '\0' &&
+                    edits[edit_index].replacement_text != NULL &&
+                    strcmp(edits[edit_index].original_text, edits[edit_index].replacement_text) != 0 &&
+                    strstr(haystack, edits[edit_index].original_text) != NULL) {
+                    out_report->messages[out_report->message_count++] = bridge_strdup("Warning: a true-rewrite block still exposed its original text after save.");
+                }
+            } else if (edits[edit_index].mode == PDF_BRIDGE_PERSISTENCE_MODE_OVERLAY_FALLBACK) {
+                out_report->messages[out_report->message_count++] = bridge_strdup("One or more blocks were saved through visual overlay fallback and may not behave like true edits in other viewers.");
             }
         }
         fz_always(ctx)
@@ -2008,7 +2839,7 @@ static int bridge_validate_saved_edits(
     }
 
     if (out_report->is_valid) {
-        out_report->messages[out_report->message_count++] = bridge_strdup("Edited pages reopened and replacement text was present in MuPDF extraction.");
+        out_report->messages[out_report->message_count++] = bridge_strdup("Edited pages reopened successfully after save.");
     }
 
     pdf_bridge_close_document(document);
@@ -2215,12 +3046,101 @@ int pdf_bridge_extract_blocks(
     return 1;
 }
 
+int pdf_bridge_preflight_save(
+    pdf_bridge_document *document,
+    const pdf_bridge_text_edit *edits,
+    size_t edit_count,
+    pdf_bridge_save_preflight_report *out_report,
+    char **out_error
+)
+{
+    bridge_resolved_edit *resolved_edits = NULL;
+    int32_t true_rewrite_count = 0;
+    int32_t overlay_fallback_count = 0;
+    int32_t blocked_count = 0;
+
+    bridge_zero_save_preflight_report(out_report);
+
+    if (!bridge_document_allows_editing(document->ctx, document)) {
+        bridge_set_error(out_error, "This PDF is currently read-only and cannot be saved through the MuPDF bridge.");
+        return 0;
+    }
+
+    resolved_edits = (bridge_resolved_edit *)calloc(edit_count == 0 ? 1 : edit_count, sizeof(*resolved_edits));
+    if (resolved_edits == NULL) {
+        bridge_set_error(out_error, "Out of memory while preparing save preflight.");
+        return 0;
+    }
+
+    for (size_t edit_index = 0; edit_index < edit_count; edit_index++) {
+        resolved_edits[edit_index].page_index = edits[edit_index].page_index;
+        resolved_edits[edit_index].native_block_id = edits[edit_index].native_block_id;
+        resolved_edits[edit_index].replacement_text = edits[edit_index].replacement_text;
+        resolved_edits[edit_index].original_text = NULL;
+        resolved_edits[edit_index].message = NULL;
+        resolved_edits[edit_index].mode = PDF_BRIDGE_PERSISTENCE_MODE_BLOCKED;
+    }
+
+    fz_try(document->ctx)
+    {
+        if (!bridge_classify_edits(document->ctx, document, resolved_edits, edit_count, out_error)) {
+            fz_throw(document->ctx, FZ_ERROR_SYSTEM, "Failed to classify save preflight edits.");
+        }
+    }
+    fz_catch(document->ctx)
+    {
+        if (out_error != NULL && *out_error == NULL) {
+            bridge_set_mupdf_error(document->ctx, out_error, "Failed to prepare save preflight");
+        }
+        bridge_clear_resolved_edits(resolved_edits, edit_count);
+        free(resolved_edits);
+        return 0;
+    }
+
+    if (!bridge_fill_block_outcomes(
+            resolved_edits,
+            edit_count,
+            &out_report->outcomes,
+            &true_rewrite_count,
+            &overlay_fallback_count,
+            &blocked_count
+        )) {
+        bridge_clear_resolved_edits(resolved_edits, edit_count);
+        free(resolved_edits);
+        bridge_set_error(out_error, "Out of memory while building the save preflight report.");
+        return 0;
+    }
+
+    out_report->outcome_count = edit_count;
+    out_report->true_rewrite_count = true_rewrite_count;
+    out_report->overlay_fallback_count = overlay_fallback_count;
+    out_report->blocked_count = blocked_count;
+
+    if (overlay_fallback_count > 0) {
+        out_report->warnings = (char **)calloc(1, sizeof(char *));
+        if (out_report->warnings == NULL) {
+            pdf_bridge_free_save_preflight_report(out_report);
+            bridge_clear_resolved_edits(resolved_edits, edit_count);
+            free(resolved_edits);
+            bridge_set_error(out_error, "Out of memory while recording save warnings.");
+            return 0;
+        }
+        out_report->warning_count = 1;
+        out_report->warnings[0] = bridge_strdup("Some edits require content overlay fallback. Explicit approval is required before save.");
+    }
+
+    bridge_clear_resolved_edits(resolved_edits, edit_count);
+    free(resolved_edits);
+    return 1;
+}
+
 int pdf_bridge_save_document(
     pdf_bridge_document *document,
     const char *destination_path,
     const pdf_bridge_text_edit *edits,
     size_t edit_count,
     pdf_bridge_save_mode requested_mode,
+    bool allow_overlay_fallback,
     pdf_bridge_save_result *out_result,
     char **out_error
 )
@@ -2230,6 +3150,9 @@ int pdf_bridge_save_document(
     char *temporary_path = NULL;
     pdf_write_options write_options;
     size_t page_start = 0;
+    int32_t true_rewrite_count = 0;
+    int32_t overlay_fallback_count = 0;
+    int32_t blocked_count = 0;
 
     bridge_zero_save_result(out_result);
 
@@ -2253,28 +3176,122 @@ int pdf_bridge_save_document(
         resolved_edits[edit_index].page_index = edits[edit_index].page_index;
         resolved_edits[edit_index].native_block_id = edits[edit_index].native_block_id;
         resolved_edits[edit_index].replacement_text = edits[edit_index].replacement_text;
+        resolved_edits[edit_index].original_text = NULL;
+        resolved_edits[edit_index].message = NULL;
+        resolved_edits[edit_index].mode = PDF_BRIDGE_PERSISTENCE_MODE_BLOCKED;
     }
 
-    qsort(resolved_edits, edit_count, sizeof(*resolved_edits), bridge_compare_edits);
+    fz_try(document->ctx)
+    {
+        if (!bridge_classify_edits(document->ctx, document, resolved_edits, edit_count, out_error)) {
+            fz_throw(document->ctx, FZ_ERROR_SYSTEM, "Failed to classify edits for save.");
+        }
+    }
+    fz_catch(document->ctx)
+    {
+        if (out_error != NULL && *out_error == NULL) {
+            bridge_set_mupdf_error(document->ctx, out_error, "Failed to classify edits for save");
+        }
+        bridge_clear_resolved_edits(resolved_edits, edit_count);
+        free(resolved_edits);
+        return 0;
+    }
+
+    if (!bridge_fill_block_outcomes(
+            resolved_edits,
+            edit_count,
+            &out_result->outcomes,
+            &true_rewrite_count,
+            &overlay_fallback_count,
+            &blocked_count
+        )) {
+        bridge_clear_resolved_edits(resolved_edits, edit_count);
+        free(resolved_edits);
+        bridge_set_error(out_error, "Out of memory while recording save outcomes.");
+        return 0;
+    }
+    out_result->outcome_count = edit_count;
+    out_result->true_rewrite_count = true_rewrite_count;
+    out_result->overlay_fallback_count = overlay_fallback_count;
+
+    if (blocked_count > 0) {
+        bridge_set_error(out_error, "One or more edits are blocked and cannot be saved.");
+        pdf_bridge_free_save_result(out_result);
+        bridge_clear_resolved_edits(resolved_edits, edit_count);
+        free(resolved_edits);
+        return 0;
+    }
+
+    if (overlay_fallback_count > 0 && !allow_overlay_fallback) {
+        bridge_set_error(out_error, "One or more edits require overlay fallback confirmation before save.");
+        pdf_bridge_free_save_result(out_result);
+        bridge_clear_resolved_edits(resolved_edits, edit_count);
+        free(resolved_edits);
+        return 0;
+    }
 
     fz_try(document->ctx)
     {
         while (page_start < edit_count) {
             size_t page_end = page_start + 1;
+            size_t page_index_count;
+            size_t true_count = 0;
+            size_t overlay_count = 0;
+            bridge_resolved_edit *true_edits = NULL;
+            bridge_resolved_edit *overlay_edits = NULL;
+            size_t page_offset = 0;
+
             while (page_end < edit_count && resolved_edits[page_end].page_index == resolved_edits[page_start].page_index) {
                 page_end++;
             }
 
-            if (!bridge_apply_page_overlay(
+            page_index_count = page_end - page_start;
+            true_edits = (bridge_resolved_edit *)calloc(page_index_count == 0 ? 1 : page_index_count, sizeof(*true_edits));
+            overlay_edits = (bridge_resolved_edit *)calloc(page_index_count == 0 ? 1 : page_index_count, sizeof(*overlay_edits));
+            if (true_edits == NULL || overlay_edits == NULL) {
+                free(true_edits);
+                free(overlay_edits);
+                fz_throw(document->ctx, FZ_ERROR_SYSTEM, "Out of memory while grouping per-page edits.");
+            }
+
+            for (page_offset = page_start; page_offset < page_end; page_offset++) {
+                if (resolved_edits[page_offset].mode == PDF_BRIDGE_PERSISTENCE_MODE_TRUE_REWRITE) {
+                    true_edits[true_count++] = resolved_edits[page_offset];
+                } else if (resolved_edits[page_offset].mode == PDF_BRIDGE_PERSISTENCE_MODE_OVERLAY_FALLBACK) {
+                    overlay_edits[overlay_count++] = resolved_edits[page_offset];
+                }
+            }
+
+            if (true_count > 0 &&
+                !bridge_apply_page_true_rewrite(
                     document->ctx,
                     document,
                     resolved_edits[page_start].page_index,
-                    resolved_edits + page_start,
-                    page_end - page_start,
+                    true_edits,
+                    true_count,
                     out_error
                 )) {
+                free(true_edits);
+                free(overlay_edits);
+                fz_throw(document->ctx, FZ_ERROR_ARGUMENT, "Failed to apply true PDF rewrite content.");
+            }
+
+            if (overlay_count > 0 &&
+                !bridge_apply_page_overlay(
+                    document->ctx,
+                    document,
+                    resolved_edits[page_start].page_index,
+                    overlay_edits,
+                    overlay_count,
+                    out_error
+                )) {
+                free(true_edits);
+                free(overlay_edits);
                 fz_throw(document->ctx, FZ_ERROR_ARGUMENT, "Failed to build one or more edited page overlays.");
             }
+
+            free(true_edits);
+            free(overlay_edits);
             page_start = page_end;
         }
 
@@ -2303,6 +3320,8 @@ int pdf_bridge_save_document(
             unlink(temporary_path);
         }
         free(temporary_path);
+        pdf_bridge_free_save_result(out_result);
+        bridge_clear_resolved_edits(resolved_edits, edit_count);
         free(resolved_edits);
         return 0;
     }
@@ -2316,17 +3335,10 @@ int pdf_bridge_save_document(
         )) {
         unlink(temporary_path);
         free(temporary_path);
+        pdf_bridge_free_save_result(out_result);
+        bridge_clear_resolved_edits(resolved_edits, edit_count);
         free(resolved_edits);
         bridge_set_error(out_error, "Saved file could not be validated after MuPDF wrote it.");
-        return 0;
-    }
-
-    if (!out_result->validation.is_valid) {
-        unlink(temporary_path);
-        free(temporary_path);
-        free(resolved_edits);
-        bridge_set_error(out_error, "Saved file failed MuPDF post-save validation.");
-        pdf_bridge_free_validation_report(&out_result->validation);
         return 0;
     }
 
@@ -2334,6 +3346,8 @@ int pdf_bridge_save_document(
         bridge_set_error(out_error, "Saved PDF validated successfully, but the temporary file could not replace the destination.");
         unlink(temporary_path);
         free(temporary_path);
+        pdf_bridge_free_save_result(out_result);
+        bridge_clear_resolved_edits(resolved_edits, edit_count);
         free(resolved_edits);
         pdf_bridge_free_validation_report(&out_result->validation);
         return 0;
@@ -2343,6 +3357,7 @@ int pdf_bridge_save_document(
     out_result->used_save_mode = PDF_BRIDGE_SAVE_MODE_FULL_REWRITE;
 
     free(temporary_path);
+    bridge_clear_resolved_edits(resolved_edits, edit_count);
     free(resolved_edits);
     return 1;
 }
@@ -2444,6 +3459,36 @@ void pdf_bridge_free_rendered_page(pdf_bridge_rendered_page *page)
     memset(page, 0, sizeof(*page));
 }
 
+static void bridge_free_block_outcomes(pdf_bridge_block_outcome *outcomes, size_t count)
+{
+    size_t index;
+
+    if (outcomes == NULL) {
+        return;
+    }
+
+    for (index = 0; index < count; index++) {
+        free(outcomes[index].message);
+    }
+    free(outcomes);
+}
+
+void pdf_bridge_free_save_preflight_report(pdf_bridge_save_preflight_report *report)
+{
+    size_t warning_index;
+
+    if (report == NULL) {
+        return;
+    }
+
+    bridge_free_block_outcomes(report->outcomes, report->outcome_count);
+    for (warning_index = 0; warning_index < report->warning_count; warning_index++) {
+        free(report->warnings[warning_index]);
+    }
+    free(report->warnings);
+    memset(report, 0, sizeof(*report));
+}
+
 void pdf_bridge_free_validation_report(pdf_bridge_validation_report *report)
 {
     size_t message_index;
@@ -2466,6 +3511,7 @@ void pdf_bridge_free_save_result(pdf_bridge_save_result *result)
         return;
     }
 
+    bridge_free_block_outcomes(result->outcomes, result->outcome_count);
     pdf_bridge_free_validation_report(&result->validation);
     memset(result, 0, sizeof(*result));
 }

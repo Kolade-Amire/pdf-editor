@@ -8,7 +8,13 @@ public protocol PDFEngine: AnyObject {
     func extractEditableBlocks(from document: LoadedPDFDocument, pageIndex: Int) throws -> [EditableTextBlock]
     func extractEditableRuns(from document: LoadedPDFDocument, pageIndex: Int) throws -> [EditableTextRun]
     func applyEdits(_ edits: [TextEdit], to document: LoadedPDFDocument) throws
-    func save(_ document: LoadedPDFDocument, to url: URL, mode: SaveMode) throws -> SaveResult
+    func preflightSave(_ edits: [TextEdit], for document: LoadedPDFDocument) throws -> SavePreflightReport
+    func save(
+        _ document: LoadedPDFDocument,
+        to url: URL,
+        mode: SaveMode,
+        allowOverlayFallback: Bool
+    ) throws -> SaveResult
     func validate(_ fileURL: URL) throws -> ValidationReport
 }
 

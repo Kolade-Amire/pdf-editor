@@ -72,13 +72,84 @@ final class DocumentSessionTests: XCTestCase {
         }
     }
 
+    func testOverlayFallbackRequiresApprovalBeforeSave() throws {
+        let url = URL(fileURLWithPath: "/tmp/overlay.pdf")
+        let block = makeBlock(
+            blockID: "overlay-block",
+            pageIndex: 0,
+            bounds: CGRect(x: 10, y: 10, width: 120, height: 40),
+            originalText: "Original",
+            persistenceMode: .overlayFallback,
+            persistenceMessage: "Saving this block requires overlay fallback."
+        )
+        let engine = MockPDFEngine(
+            url: url,
+            blocksByPage: [0: [block]],
+            preflightModesByBlockID: ["overlay-block": .overlayFallback]
+        )
+        let session = DocumentSession(engine: engine)
+
+        try session.load(url: url)
+        session.selectBlock("overlay-block")
+        session.updateDraftText("Updated")
+
+        let preflight = try session.prepareSave()
+        XCTAssertTrue(preflight.requiresOverlayConfirmation)
+        XCTAssertEqual(preflight.overlayFallbackCount, 1)
+
+        XCTAssertThrowsError(try session.save()) { error in
+            XCTAssertEqual(
+                error as? PDFEditorError,
+                .saveFailed("One or more edits require overlay fallback confirmation before save.")
+            )
+        }
+
+        let result = try session.save(allowOverlayFallback: true)
+        XCTAssertEqual(result.overlayFallbackCount, 1)
+        XCTAssertEqual(engine.saveAllowOverlayFallbackFlags, [true])
+    }
+
+    func testPrepareSaveReportsBlockedEditsWithoutSaving() throws {
+        let url = URL(fileURLWithPath: "/tmp/blocked.pdf")
+        let issue = EditabilityIssue(kind: .unsupportedStructure, message: "This block cannot be rewritten safely.")
+        let block = makeBlock(
+            blockID: "blocked-block",
+            pageIndex: 0,
+            bounds: CGRect(x: 10, y: 10, width: 120, height: 40),
+            originalText: "Original",
+            isEditable: true,
+            failureReason: nil,
+            persistenceMode: .blocked,
+            persistenceMessage: issue.message
+        )
+        let engine = MockPDFEngine(
+            url: url,
+            blocksByPage: [0: [block]],
+            preflightModesByBlockID: ["blocked-block": .blocked],
+            preflightMessagesByBlockID: ["blocked-block": issue.message]
+        )
+        let session = DocumentSession(engine: engine)
+
+        try session.load(url: url)
+        session.selectBlock("blocked-block")
+        session.updateDraftText("Updated")
+
+        let report = try session.prepareSave()
+        XCTAssertFalse(report.canProceed)
+        XCTAssertEqual(report.blockedCount, 1)
+        XCTAssertEqual(session.statusMessage, issue.message)
+        XCTAssertTrue(engine.savedURLs.isEmpty)
+    }
+
     private func makeBlock(
         blockID: String,
         pageIndex: Int,
         bounds: CGRect,
         originalText: String,
         isEditable: Bool = true,
-        failureReason: EditabilityIssue? = nil
+        failureReason: EditabilityIssue? = nil,
+        persistenceMode: BlockPersistenceMode = .trueRewrite,
+        persistenceMessage: String? = nil
     ) -> EditableTextBlock {
         let style = TextStyle(fontPostScriptName: "Helvetica", fontSize: 12, color: .black)
         let fragment = BlockLineFragment(
@@ -109,7 +180,9 @@ final class DocumentSessionTests: XCTestCase {
                 resolvedFontName: "Helvetica",
                 family: .sans,
                 source: .originalFont
-            )
+            ),
+            persistenceMode: persistenceMode,
+            persistenceMessage: persistenceMessage
         )
     }
 }
@@ -118,8 +191,17 @@ private final class MockPDFEngine: PDFEngine {
     var document: LoadedPDFDocument
     var blocksByPage: [Int: [EditableTextBlock]]
     var savedURLs: [URL] = []
+    var saveAllowOverlayFallbackFlags: [Bool] = []
+    private let preflightModesByBlockID: [String: BlockPersistenceMode]
+    private let preflightMessagesByBlockID: [String: String]
 
-    init(url: URL, blocksByPage: [Int: [EditableTextBlock]], isEditable: Bool = true) {
+    init(
+        url: URL,
+        blocksByPage: [Int: [EditableTextBlock]],
+        isEditable: Bool = true,
+        preflightModesByBlockID: [String: BlockPersistenceMode] = [:],
+        preflightMessagesByBlockID: [String: String] = [:]
+    ) {
         let pageReports = blocksByPage.keys.sorted().map { pageIndex in
             PageEditabilityReport(pageIndex: pageIndex, isEditable: isEditable, issues: [])
         }
@@ -139,6 +221,8 @@ private final class MockPDFEngine: PDFEngine {
             editabilityReport: report
         )
         self.blocksByPage = blocksByPage
+        self.preflightModesByBlockID = preflightModesByBlockID
+        self.preflightMessagesByBlockID = preflightMessagesByBlockID
     }
 
     func open(url: URL) throws -> LoadedPDFDocument {
@@ -191,13 +275,63 @@ private final class MockPDFEngine: PDFEngine {
                     lineFragments: fragments,
                     isEditable: block.isEditable,
                     failureReason: block.failureReason,
-                    fallbackPlan: block.fallbackPlan
+                    fallbackPlan: block.fallbackPlan,
+                    persistenceMode: block.persistenceMode,
+                    persistenceMessage: block.persistenceMessage
                 )
             }
         }
     }
 
-    func save(_ document: LoadedPDFDocument, to url: URL, mode: SaveMode) throws -> SaveResult {
+    func preflightSave(_ edits: [TextEdit], for document: LoadedPDFDocument) throws -> SavePreflightReport {
+        let blockMap = Dictionary(uniqueKeysWithValues: blocksByPage.values.joined().map { ($0.id, $0) })
+        let outcomes = edits.compactMap { edit -> SavePreflightBlockOutcome? in
+            guard let block = blockMap[edit.blockID] else {
+                return nil
+            }
+
+            let mode = preflightModesByBlockID[edit.blockID] ?? block.persistenceMode
+            let message = preflightMessagesByBlockID[edit.blockID]
+                ?? block.persistenceMessage
+                ?? mode.displayName
+
+            return SavePreflightBlockOutcome(
+                blockID: edit.blockID,
+                pageIndex: block.pageIndex,
+                mode: mode,
+                message: message
+            )
+        }
+        return SavePreflightReport(blockOutcomes: outcomes)
+    }
+
+    func save(
+        _ document: LoadedPDFDocument,
+        to url: URL,
+        mode: SaveMode,
+        allowOverlayFallback: Bool
+    ) throws -> SaveResult {
+        _ = mode
+        let report = try preflightSave(
+            blocksByPage.values.joined()
+                .filter { $0.currentText != $0.originalText }
+                .map { TextEdit(blockID: $0.id, replacementText: $0.currentText) },
+            for: document
+        )
+
+        if report.blockedCount > 0 {
+            throw PDFEditorError.saveFailed(
+                report.blockOutcomes
+                    .filter { $0.mode == .blocked }
+                    .map(\.message)
+                    .joined(separator: " ")
+            )
+        }
+        if report.requiresOverlayConfirmation && !allowOverlayFallback {
+            throw PDFEditorError.saveFailed("One or more edits require overlay fallback confirmation before save.")
+        }
+
+        saveAllowOverlayFallbackFlags.append(allowOverlayFallback)
         savedURLs.append(url)
         self.document = LoadedPDFDocument(
             id: document.id,
@@ -218,6 +352,14 @@ private final class MockPDFEngine: PDFEngine {
             fileURL: url,
             usedSaveMode: .fullRewrite,
             appliedEditCount: blocksByPage.values.joined().filter { $0.currentText != $0.originalText }.count,
+            savedBlockOutcomes: report.blockOutcomes.map {
+                SavedBlockOutcome(
+                    blockID: $0.blockID,
+                    pageIndex: $0.pageIndex,
+                    mode: $0.mode,
+                    message: $0.message
+                )
+            },
             validationReport: ValidationReport(isValid: true, validator: "Mock", messages: [])
         )
     }

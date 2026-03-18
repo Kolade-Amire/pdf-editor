@@ -58,9 +58,19 @@ public final class CompositePDFEngine: PDFEngine {
         try engine.applyEdits(edits, to: document)
     }
 
-    public func save(_ document: LoadedPDFDocument, to url: URL, mode: SaveMode) throws -> SaveResult {
+    public func preflightSave(_ edits: [TextEdit], for document: LoadedPDFDocument) throws -> SavePreflightReport {
         let engine = try engine(for: document)
-        return try engine.save(document, to: url, mode: mode)
+        return try engine.preflightSave(edits, for: document)
+    }
+
+    public func save(
+        _ document: LoadedPDFDocument,
+        to url: URL,
+        mode: SaveMode,
+        allowOverlayFallback: Bool
+    ) throws -> SaveResult {
+        let engine = try engine(for: document)
+        return try engine.save(document, to: url, mode: mode, allowOverlayFallback: allowOverlayFallback)
     }
 
     public func validate(_ fileURL: URL) throws -> ValidationReport {

@@ -38,6 +38,42 @@ struct EditorRootView: View {
                 .disabled(appState.session.document == nil)
             }
         }
+        .alert("PDF Editor", isPresented: Binding(
+            get: { appState.errorMessage != nil },
+            set: { if !$0 { appState.errorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) {
+                appState.errorMessage = nil
+            }
+        } message: {
+            Text(appState.errorMessage ?? "")
+        }
+        .alert("Overlay Fallback Required", isPresented: Binding(
+            get: { appState.overlaySaveRequest != nil },
+            set: { if !$0 { appState.cancelOverlaySave() } }
+        )) {
+            Button("Cancel", role: .cancel) {
+                appState.cancelOverlaySave()
+            }
+            Button("Continue Save") {
+                appState.confirmOverlaySave()
+            }
+        } message: {
+            Text(overlayMessage)
+        }
+    }
+
+    private var overlayMessage: String {
+        guard let request = appState.overlaySaveRequest else {
+            return ""
+        }
+
+        let overlayLines = request.report.blockOutcomes
+            .filter { $0.mode == .overlayFallback }
+            .map { "Page \($0.pageIndex + 1): \($0.message)" }
+
+        return ([ "True rewrite is unavailable for some edited blocks. Saving will use visual content overlay for those blocks only." ] + overlayLines)
+            .joined(separator: "\n")
     }
 }
 
@@ -172,6 +208,14 @@ private struct InspectorView: View {
                         Text("Page \(block.pageIndex + 1)")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                        Text(block.persistenceMode.displayName)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(persistenceColor(for: block.persistenceMode))
+                        if let persistenceMessage = block.persistenceMessage {
+                            Text(persistenceMessage)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                         TextEditor(text: Binding(
                             get: { session.draftText },
                             set: { session.updateDraftText($0) }
@@ -205,6 +249,17 @@ private struct InspectorView: View {
                 }
             }
             .padding(18)
+        }
+    }
+
+    private func persistenceColor(for mode: BlockPersistenceMode) -> Color {
+        switch mode {
+        case .trueRewrite:
+            return .green
+        case .overlayFallback:
+            return .orange
+        case .blocked:
+            return .secondary
         }
     }
 }

@@ -23,6 +23,12 @@ typedef enum {
 } pdf_bridge_save_mode;
 
 typedef enum {
+    PDF_BRIDGE_PERSISTENCE_MODE_TRUE_REWRITE = 0,
+    PDF_BRIDGE_PERSISTENCE_MODE_OVERLAY_FALLBACK = 1,
+    PDF_BRIDGE_PERSISTENCE_MODE_BLOCKED = 2,
+} pdf_bridge_persistence_mode;
+
+typedef enum {
     PDF_BRIDGE_ISSUE_ENCRYPTED = 0,
     PDF_BRIDGE_ISSUE_IMAGE_ONLY = 1,
     PDF_BRIDGE_ISSUE_SIGNED = 2,
@@ -157,6 +163,8 @@ typedef struct {
     bool has_failure_reason;
     pdf_bridge_issue failure_reason;
     pdf_bridge_font_plan fallback_plan;
+    pdf_bridge_persistence_mode persistence_mode;
+    char *persistence_message;
     size_t line_count;
     pdf_bridge_line_fragment *lines;
 } pdf_bridge_text_block;
@@ -180,6 +188,23 @@ typedef struct {
 } pdf_bridge_text_edit;
 
 typedef struct {
+    int32_t page_index;
+    int32_t native_block_id;
+    pdf_bridge_persistence_mode mode;
+    char *message;
+} pdf_bridge_block_outcome;
+
+typedef struct {
+    size_t outcome_count;
+    pdf_bridge_block_outcome *outcomes;
+    size_t warning_count;
+    char **warnings;
+    int32_t true_rewrite_count;
+    int32_t overlay_fallback_count;
+    int32_t blocked_count;
+} pdf_bridge_save_preflight_report;
+
+typedef struct {
     bool is_valid;
     char *validator;
     size_t message_count;
@@ -188,7 +213,11 @@ typedef struct {
 
 typedef struct {
     int32_t applied_edit_count;
+    int32_t true_rewrite_count;
+    int32_t overlay_fallback_count;
     pdf_bridge_save_mode used_save_mode;
+    size_t outcome_count;
+    pdf_bridge_block_outcome *outcomes;
     pdf_bridge_validation_report validation;
 } pdf_bridge_save_result;
 
@@ -233,7 +262,16 @@ int pdf_bridge_save_document(
     const pdf_bridge_text_edit *edits,
     size_t edit_count,
     pdf_bridge_save_mode requested_mode,
+    bool allow_overlay_fallback,
     pdf_bridge_save_result *out_result,
+    char **out_error
+);
+
+int pdf_bridge_preflight_save(
+    pdf_bridge_document *document,
+    const pdf_bridge_text_edit *edits,
+    size_t edit_count,
+    pdf_bridge_save_preflight_report *out_report,
     char **out_error
 );
 
@@ -247,6 +285,7 @@ void pdf_bridge_free_document_info(pdf_bridge_document_info *info);
 void pdf_bridge_free_editability_report(pdf_bridge_editability_report *report);
 void pdf_bridge_free_text_block_array(pdf_bridge_text_block_array *blocks);
 void pdf_bridge_free_rendered_page(pdf_bridge_rendered_page *page);
+void pdf_bridge_free_save_preflight_report(pdf_bridge_save_preflight_report *report);
 void pdf_bridge_free_validation_report(pdf_bridge_validation_report *report);
 void pdf_bridge_free_save_result(pdf_bridge_save_result *result);
 void pdf_bridge_free_error(char *error_message);

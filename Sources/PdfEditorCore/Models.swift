@@ -325,6 +325,27 @@ public struct EditableTextRun: Identifiable, Hashable, Sendable {
     }
 }
 
+public enum BlockPersistenceMode: String, Hashable, Sendable {
+    case trueRewrite
+    case overlayFallback
+    case blocked
+
+    public var displayName: String {
+        switch self {
+        case .trueRewrite:
+            "True edit"
+        case .overlayFallback:
+            "Overlay fallback if saved"
+        case .blocked:
+            "Read-only"
+        }
+    }
+
+    public var requiresExplicitConfirmation: Bool {
+        self == .overlayFallback
+    }
+}
+
 public struct EditableTextBlock: Identifiable, Hashable, Sendable {
     public let id: String
     public let pageIndex: Int
@@ -336,6 +357,8 @@ public struct EditableTextBlock: Identifiable, Hashable, Sendable {
     public let isEditable: Bool
     public let failureReason: EditabilityIssue?
     public let fallbackPlan: FontFallbackPlan
+    public let persistenceMode: BlockPersistenceMode
+    public let persistenceMessage: String?
 
     public init(
         id: String,
@@ -347,7 +370,9 @@ public struct EditableTextBlock: Identifiable, Hashable, Sendable {
         lineFragments: [BlockLineFragment],
         isEditable: Bool,
         failureReason: EditabilityIssue?,
-        fallbackPlan: FontFallbackPlan
+        fallbackPlan: FontFallbackPlan,
+        persistenceMode: BlockPersistenceMode,
+        persistenceMessage: String? = nil
     ) {
         self.id = id
         self.pageIndex = pageIndex
@@ -359,6 +384,8 @@ public struct EditableTextBlock: Identifiable, Hashable, Sendable {
         self.isEditable = isEditable
         self.failureReason = failureReason
         self.fallbackPlan = fallbackPlan
+        self.persistenceMode = persistenceMode
+        self.persistenceMessage = persistenceMessage
     }
 
     public var displayRuns: [EditableTextRun] {
@@ -407,22 +434,99 @@ public struct ValidationReport: Hashable, Sendable {
     }
 }
 
+public struct SavePreflightBlockOutcome: Identifiable, Hashable, Sendable {
+    public let blockID: String
+    public let pageIndex: Int
+    public let mode: BlockPersistenceMode
+    public let message: String
+
+    public init(blockID: String, pageIndex: Int, mode: BlockPersistenceMode, message: String) {
+        self.blockID = blockID
+        self.pageIndex = pageIndex
+        self.mode = mode
+        self.message = message
+    }
+
+    public var id: String {
+        "\(pageIndex):\(blockID):\(mode.rawValue):\(message)"
+    }
+}
+
+public struct SavePreflightReport: Hashable, Sendable {
+    public let blockOutcomes: [SavePreflightBlockOutcome]
+    public let warnings: [String]
+
+    public init(blockOutcomes: [SavePreflightBlockOutcome], warnings: [String] = []) {
+        self.blockOutcomes = blockOutcomes
+        self.warnings = warnings
+    }
+
+    public var trueRewriteCount: Int {
+        blockOutcomes.filter { $0.mode == .trueRewrite }.count
+    }
+
+    public var overlayFallbackCount: Int {
+        blockOutcomes.filter { $0.mode == .overlayFallback }.count
+    }
+
+    public var blockedCount: Int {
+        blockOutcomes.filter { $0.mode == .blocked }.count
+    }
+
+    public var requiresOverlayConfirmation: Bool {
+        overlayFallbackCount > 0
+    }
+
+    public var canProceed: Bool {
+        blockedCount == 0
+    }
+}
+
+public struct SavedBlockOutcome: Identifiable, Hashable, Sendable {
+    public let blockID: String
+    public let pageIndex: Int
+    public let mode: BlockPersistenceMode
+    public let message: String
+
+    public init(blockID: String, pageIndex: Int, mode: BlockPersistenceMode, message: String) {
+        self.blockID = blockID
+        self.pageIndex = pageIndex
+        self.mode = mode
+        self.message = message
+    }
+
+    public var id: String {
+        "\(pageIndex):\(blockID):\(mode.rawValue):\(message)"
+    }
+}
+
 public struct SaveResult: Hashable, Sendable {
     public let fileURL: URL
     public let usedSaveMode: SaveMode
     public let appliedEditCount: Int
+    public let savedBlockOutcomes: [SavedBlockOutcome]
     public let validationReport: ValidationReport
 
     public init(
         fileURL: URL,
         usedSaveMode: SaveMode,
         appliedEditCount: Int,
+        savedBlockOutcomes: [SavedBlockOutcome],
         validationReport: ValidationReport
     ) {
         self.fileURL = fileURL
         self.usedSaveMode = usedSaveMode
         self.appliedEditCount = appliedEditCount
+        self.savedBlockOutcomes = savedBlockOutcomes
         self.validationReport = validationReport
+    }
+
+    public var trueRewriteCount: Int {
+        savedBlockOutcomes.filter { $0.mode == .trueRewrite }.count
+    }
+
+    public var overlayFallbackCount: Int {
+        savedBlockOutcomes.filter { $0.mode == .overlayFallback }.count
     }
 }
 
