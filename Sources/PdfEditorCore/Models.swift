@@ -416,6 +416,34 @@ public struct TextEdit: Hashable, Sendable {
     }
 }
 
+package enum PageBlockLoadState: Hashable, Sendable {
+    case unloaded
+    case loading
+    case loaded
+    case failed(message: String)
+
+    package var displayName: String {
+        switch self {
+        case .unloaded:
+            "Not loaded"
+        case .loading:
+            "Loading editable blocks"
+        case .loaded:
+            "Loaded"
+        case .failed:
+            "Failed to load"
+        }
+    }
+
+    package var failureMessage: String? {
+        guard case .failed(let message) = self else {
+            return nil
+        }
+
+        return message
+    }
+}
+
 public enum SaveMode: String, Hashable, Sendable {
     case automatic
     case incremental

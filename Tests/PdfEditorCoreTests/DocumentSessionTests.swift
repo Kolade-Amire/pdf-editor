@@ -4,6 +4,134 @@ import XCTest
 
 @MainActor
 final class DocumentSessionTests: XCTestCase {
+    func testLoadIsMetadataFirstUntilBlocksAreRequested() throws {
+        let url = URL(fileURLWithPath: "/tmp/metadata-first.pdf")
+        let pageZeroBlock = makeBlock(
+            blockID: "page-0-block",
+            pageIndex: 0,
+            bounds: CGRect(x: 10, y: 10, width: 120, height: 40),
+            originalText: "Page 0"
+        )
+        let pageOneBlock = makeBlock(
+            blockID: "page-1-block",
+            pageIndex: 1,
+            bounds: CGRect(x: 10, y: 10, width: 120, height: 40),
+            originalText: "Page 1"
+        )
+        let engine = MockPDFEngine(url: url, blocksByPage: [0: [pageZeroBlock], 1: [pageOneBlock]])
+        let session = DocumentSession(engine: engine)
+
+        try session.load(url: url)
+
+        XCTAssertEqual(session.document?.descriptor.sourceURL, url)
+        XCTAssertEqual(session.pageCount, 2)
+        XCTAssertTrue(session.pageBlocks.isEmpty)
+        XCTAssertEqual(session.pageLoadState(for: 0), .unloaded)
+        XCTAssertTrue(engine.extractCallCountsByPage.isEmpty)
+    }
+
+    func testLoadCurrentPagePopulatesOnlyRequestedPage() throws {
+        let url = URL(fileURLWithPath: "/tmp/lazy-page-load.pdf")
+        let pageZeroBlock = makeBlock(
+            blockID: "page-0-block",
+            pageIndex: 0,
+            bounds: CGRect(x: 10, y: 10, width: 120, height: 40),
+            originalText: "Page 0"
+        )
+        let pageOneBlock = makeBlock(
+            blockID: "page-1-block",
+            pageIndex: 1,
+            bounds: CGRect(x: 10, y: 10, width: 120, height: 40),
+            originalText: "Page 1"
+        )
+        let engine = MockPDFEngine(url: url, blocksByPage: [0: [pageZeroBlock], 1: [pageOneBlock]])
+        let session = DocumentSession(engine: engine)
+
+        try session.load(url: url)
+        session.loadBlocksIfNeeded(for: 0)
+
+        XCTAssertEqual(session.pageLoadState(for: 0), .loaded)
+        XCTAssertEqual(session.pageLoadState(for: 1), .unloaded)
+        XCTAssertEqual(session.pageBlocks[0]?.map(\.id), ["page-0-block"])
+        XCTAssertNil(session.pageBlocks[1])
+        XCTAssertEqual(engine.extractCallCountsByPage[0], 1)
+        XCTAssertNil(engine.extractCallCountsByPage[1])
+    }
+
+    func testNavigatingToAnotherPageLoadsThatPageOnce() throws {
+        let url = URL(fileURLWithPath: "/tmp/page-navigation.pdf")
+        let pageZeroBlock = makeBlock(
+            blockID: "page-0-block",
+            pageIndex: 0,
+            bounds: CGRect(x: 10, y: 10, width: 120, height: 40),
+            originalText: "Page 0"
+        )
+        let pageOneBlock = makeBlock(
+            blockID: "page-1-block",
+            pageIndex: 1,
+            bounds: CGRect(x: 10, y: 10, width: 120, height: 40),
+            originalText: "Page 1"
+        )
+        let engine = MockPDFEngine(url: url, blocksByPage: [0: [pageZeroBlock], 1: [pageOneBlock]])
+        let session = DocumentSession(engine: engine)
+
+        try session.load(url: url)
+        session.loadBlocksIfNeeded(for: 0)
+        session.loadBlocksIfNeeded(for: 0)
+        session.loadBlocksIfNeeded(for: 1)
+
+        XCTAssertEqual(engine.extractCallCountsByPage[0], 1)
+        XCTAssertEqual(engine.extractCallCountsByPage[1], 1)
+
+        session.reloadBlocks(for: 1)
+        XCTAssertEqual(engine.extractCallCountsByPage[1], 2)
+    }
+
+    func testPageExtractionFailureKeepsDocumentOpen() throws {
+        let url = URL(fileURLWithPath: "/tmp/page-failure.pdf")
+        let block = makeBlock(
+            blockID: "page-0-block",
+            pageIndex: 0,
+            bounds: CGRect(x: 10, y: 10, width: 120, height: 40),
+            originalText: "Page 0"
+        )
+        let engine = MockPDFEngine(
+            url: url,
+            blocksByPage: [0: [block]],
+            pageExtractionErrors: [1: PDFEditorError.saveFailed("Page 2 failed.")]
+        )
+        engine.document = LoadedPDFDocument(
+            id: engine.document.id,
+            descriptor: PDFDocumentDescriptor(
+                sourceURL: url,
+                pageCount: 2,
+                title: url.lastPathComponent,
+                isEncrypted: false,
+                isLocked: false,
+                canEdit: true,
+                isSigned: false,
+                backend: .muPDFEditable
+            ),
+            editabilityReport: EditabilityReport(
+                isEditable: true,
+                issues: [],
+                pageReports: [
+                    PageEditabilityReport(pageIndex: 0, isEditable: true, issues: []),
+                    PageEditabilityReport(pageIndex: 1, isEditable: true, issues: []),
+                ]
+            )
+        )
+        let session = DocumentSession(engine: engine)
+
+        try session.load(url: url)
+        session.loadBlocksIfNeeded(for: 1)
+
+        XCTAssertEqual(session.document?.descriptor.sourceURL, url)
+        XCTAssertEqual(session.pageLoadState(for: 1), .failed(message: "Page 2 failed."))
+        XCTAssertEqual(session.pageBlocks[1], [])
+        XCTAssertEqual(engine.extractCallCountsByPage[1], 1)
+    }
+
     func testEditableBlockStagesPendingEditAndSaves() throws {
         let url = URL(fileURLWithPath: "/tmp/sample.pdf")
         let block = makeBlock(
@@ -16,6 +144,7 @@ final class DocumentSessionTests: XCTestCase {
         let session = DocumentSession(engine: engine)
 
         try session.load(url: url)
+        session.loadBlocksIfNeeded(for: 0)
         session.selectBlock("block-1")
         session.updateDraftText("Updated")
 
@@ -44,6 +173,7 @@ final class DocumentSessionTests: XCTestCase {
         let session = DocumentSession(engine: engine)
 
         try session.load(url: url)
+        session.loadBlocksIfNeeded(for: 0)
         session.selectBlock("locked-block")
         session.updateDraftText("Nope")
 
@@ -64,6 +194,7 @@ final class DocumentSessionTests: XCTestCase {
         let session = DocumentSession(engine: engine)
 
         try session.load(url: url)
+        session.loadBlocksIfNeeded(for: 0)
         session.selectBlock("tight-block")
         session.updateDraftText("This text is too long for the box")
 
@@ -90,6 +221,7 @@ final class DocumentSessionTests: XCTestCase {
         let session = DocumentSession(engine: engine)
 
         try session.load(url: url)
+        session.loadBlocksIfNeeded(for: 0)
         session.selectBlock("overlay-block")
         session.updateDraftText("Updated")
 
@@ -131,6 +263,7 @@ final class DocumentSessionTests: XCTestCase {
         let session = DocumentSession(engine: engine)
 
         try session.load(url: url)
+        session.loadBlocksIfNeeded(for: 0)
         session.selectBlock("blocked-block")
         session.updateDraftText("Updated")
 
@@ -190,17 +323,20 @@ final class DocumentSessionTests: XCTestCase {
 private final class MockPDFEngine: PDFEngine {
     var document: LoadedPDFDocument
     var blocksByPage: [Int: [EditableTextBlock]]
+    var extractCallCountsByPage: [Int: Int] = [:]
     var savedURLs: [URL] = []
     var saveAllowOverlayFallbackFlags: [Bool] = []
     private let preflightModesByBlockID: [String: BlockPersistenceMode]
     private let preflightMessagesByBlockID: [String: String]
+    private let pageExtractionErrors: [Int: Error]
 
     init(
         url: URL,
         blocksByPage: [Int: [EditableTextBlock]],
         isEditable: Bool = true,
         preflightModesByBlockID: [String: BlockPersistenceMode] = [:],
-        preflightMessagesByBlockID: [String: String] = [:]
+        preflightMessagesByBlockID: [String: String] = [:],
+        pageExtractionErrors: [Int: Error] = [:]
     ) {
         let pageReports = blocksByPage.keys.sorted().map { pageIndex in
             PageEditabilityReport(pageIndex: pageIndex, isEditable: isEditable, issues: [])
@@ -223,6 +359,7 @@ private final class MockPDFEngine: PDFEngine {
         self.blocksByPage = blocksByPage
         self.preflightModesByBlockID = preflightModesByBlockID
         self.preflightMessagesByBlockID = preflightMessagesByBlockID
+        self.pageExtractionErrors = pageExtractionErrors
     }
 
     func open(url: URL) throws -> LoadedPDFDocument {
@@ -238,7 +375,13 @@ private final class MockPDFEngine: PDFEngine {
     }
 
     func extractEditableBlocks(from document: LoadedPDFDocument, pageIndex: Int) throws -> [EditableTextBlock] {
-        blocksByPage[pageIndex] ?? []
+        extractCallCountsByPage[pageIndex, default: 0] += 1
+
+        if let error = pageExtractionErrors[pageIndex] {
+            throw error
+        }
+
+        return blocksByPage[pageIndex] ?? []
     }
 
     func applyEdits(_ edits: [TextEdit], to document: LoadedPDFDocument) throws {

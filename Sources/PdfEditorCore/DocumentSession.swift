@@ -6,6 +6,7 @@ import Foundation
 public final class DocumentSession: ObservableObject {
     @Published public private(set) var document: LoadedPDFDocument?
     @Published public private(set) var pageBlocks: [Int: [EditableTextBlock]] = [:]
+    @Published package private(set) var pageLoadStates: [Int: PageBlockLoadState] = [:]
     @Published public private(set) var pendingEdits: [String: TextEdit] = [:]
     @Published public private(set) var selectedBlockID: String?
     @Published public private(set) var selectedRunID: String?
@@ -39,6 +40,10 @@ public final class DocumentSession: ObservableObject {
 
     public var currentPageRuns: [EditableTextRun] {
         runs(for: currentPageIndex)
+    }
+
+    package var currentPageLoadState: PageBlockLoadState {
+        pageLoadState(for: currentPageIndex)
     }
 
     public var selectedBlock: EditableTextBlock? {
@@ -91,12 +96,8 @@ public final class DocumentSession: ObservableObject {
         lastValidationReport = nil
         pendingSavePreflight = nil
         statusMessage = nil
-
-        if !requiresPassword {
-            try refreshAllBlocks()
-        } else {
-            pageBlocks = [:]
-        }
+        pageBlocks = [:]
+        pageLoadStates = [:]
     }
 
     public func unlock(with password: String) throws {
@@ -108,15 +109,23 @@ public final class DocumentSession: ObservableObject {
         self.document = unlockedDocument
         requiresPassword = unlockedDocument.descriptor.isLocked
         isReadOnly = !unlockedDocument.editabilityReport.isEditable
+        pageBlocks = [:]
+        pageLoadStates = [:]
+        selectedBlockID = nil
+        selectedRunID = nil
+        draftText = ""
 
         if !requiresPassword {
-            try refreshAllBlocks()
             statusMessage = "Document unlocked."
         }
     }
 
     public func blocks(for pageIndex: Int) -> [EditableTextBlock] {
         pageBlocks[pageIndex] ?? []
+    }
+
+    package func pageLoadState(for pageIndex: Int) -> PageBlockLoadState {
+        pageLoadStates[pageIndex] ?? .unloaded
     }
 
     public func runs(for pageIndex: Int) -> [EditableTextRun] {
@@ -184,7 +193,7 @@ public final class DocumentSession: ObservableObject {
 
         pendingSavePreflight = nil
         stagePendingEdits()
-        refreshPageBlocksIfPossible(pageIndex: block.pageIndex)
+        reloadBlocks(for: block.pageIndex)
     }
 
     public func discardSelectedEdit() {
@@ -196,7 +205,7 @@ public final class DocumentSession: ObservableObject {
         draftText = block.originalText
         pendingSavePreflight = nil
         stagePendingEdits()
-        refreshPageBlocksIfPossible(pageIndex: block.pageIndex)
+        reloadBlocks(for: block.pageIndex)
     }
 
     public func prepareSave(to url: URL? = nil) throws -> SavePreflightReport {
@@ -278,38 +287,75 @@ public final class DocumentSession: ObservableObject {
         return report
     }
 
-    private func refreshAllBlocks() throws {
-        guard let document else {
-            throw PDFEditorError.missingDocument
-        }
-
-        var refreshedBlocks: [Int: [EditableTextBlock]] = [:]
-
-        for pageIndex in 0..<document.descriptor.pageCount {
-            refreshedBlocks[pageIndex] = try engine.extractEditableBlocks(from: document, pageIndex: pageIndex)
-        }
-
-        pageBlocks = refreshedBlocks
-        if let selectedBlockID {
-            let selectedRunID = selectedRunID
-            selectBlock(selectedBlockID, preferredRunID: selectedRunID)
-        }
+    package func loadBlocksIfNeeded(for pageIndex: Int) {
+        loadBlocks(for: pageIndex, forceReload: false)
     }
 
-    private func refreshPageBlocksIfPossible(pageIndex: Int) {
+    package func reloadCurrentPageBlocks() {
+        reloadBlocks(for: currentPageIndex)
+    }
+
+    package func reloadBlocks(for pageIndex: Int) {
+        loadBlocks(for: pageIndex, forceReload: true)
+    }
+
+    private func loadBlocks(for pageIndex: Int, forceReload: Bool) {
         guard let document else {
             return
         }
 
+        guard !requiresPassword else {
+            return
+        }
+
+        guard (0..<document.descriptor.pageCount).contains(pageIndex) else {
+            return
+        }
+
+        let currentState = pageLoadState(for: pageIndex)
+        if !forceReload {
+            switch currentState {
+            case .loaded, .loading:
+                return
+            case .unloaded, .failed:
+                break
+            }
+        }
+
+        pageLoadStates[pageIndex] = .loading
+
         do {
             pageBlocks[pageIndex] = try engine.extractEditableBlocks(from: document, pageIndex: pageIndex)
-            if let selectedBlockID {
-                let selectedRunID = selectedRunID
-                selectBlock(selectedBlockID, preferredRunID: selectedRunID)
-            }
+            pageLoadStates[pageIndex] = .loaded
+            syncSelectionAfterPageRefresh(pageIndex: pageIndex)
+            return
         } catch {
-            statusMessage = error.localizedDescription
+            pageBlocks[pageIndex] = []
+            pageLoadStates[pageIndex] = .failed(message: error.localizedDescription)
+            clearSelectionIfNeeded(for: pageIndex)
         }
+    }
+
+    private func syncSelectionAfterPageRefresh(pageIndex: Int) {
+        guard let selectedBlockID else {
+            return
+        }
+
+        guard blocks(for: pageIndex).contains(where: { $0.id == selectedBlockID }) else {
+            clearSelectionIfNeeded(for: pageIndex)
+            return
+        }
+
+        let preferredRunID = selectedRunID
+        selectBlock(selectedBlockID, preferredRunID: preferredRunID)
+    }
+
+    private func clearSelectionIfNeeded(for pageIndex: Int) {
+        guard selectedBlock?.pageIndex == pageIndex || selectedRun?.pageIndex == pageIndex else {
+            return
+        }
+
+        selectBlock(nil)
     }
 
     private func stagePendingEdits() {

@@ -126,10 +126,29 @@ private struct WorkspaceView: View {
     var body: some View {
         HSplitView {
             VStack(spacing: 0) {
-                PageCanvasRepresentable(session: session, pageIndex: session.currentPageIndex)
+                ZStack {
+                    PageCanvasRepresentable(session: session, pageIndex: session.currentPageIndex)
+                    PageLoadOverlay(loadState: session.currentPageLoadState)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
                 StatusBanner(session: session)
             }
             .frame(minWidth: 700, minHeight: 600)
+            .task(id: pageLoadTaskID) {
+                guard session.document != nil, !session.requiresPassword else {
+                    return
+                }
+
+                session.loadBlocksIfNeeded(for: session.currentPageIndex)
+            }
+            .onChange(of: session.currentPageIndex, initial: false) { _, newPageIndex in
+                guard session.selectedBlock?.pageIndex != newPageIndex else {
+                    return
+                }
+
+                session.selectBlock(nil)
+            }
 
             InspectorView(
                 session: session,
@@ -139,6 +158,11 @@ private struct WorkspaceView: View {
             .frame(minWidth: 280, idealWidth: 320)
         }
     }
+
+    private var pageLoadTaskID: String {
+        let documentID = session.document?.id.uuidString ?? "no-document"
+        return "\(documentID):\(session.currentPageIndex):\(session.requiresPassword)"
+    }
 }
 
 private struct StatusBanner: View {
@@ -146,6 +170,19 @@ private struct StatusBanner: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            switch session.currentPageLoadState {
+            case .loading:
+                Text("Loading editable blocks for page \(session.currentPageIndex + 1)…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .failed(let message):
+                Text("Page \(session.currentPageIndex + 1) block extraction failed: \(message)")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            case .unloaded, .loaded:
+                EmptyView()
+            }
+
             if let statusMessage = session.statusMessage {
                 Text(statusMessage)
                     .font(.subheadline)
@@ -160,6 +197,39 @@ private struct StatusBanner: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
         .background(.thinMaterial)
+    }
+}
+
+private struct PageLoadOverlay: View {
+    let loadState: PageBlockLoadState
+
+    var body: some View {
+        switch loadState {
+        case .unloaded, .loading:
+            VStack(spacing: 12) {
+                ProgressView()
+                Text("Loading editable blocks…")
+                    .font(.headline)
+                Text("The page preview is ready. Text block extraction is still in progress.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(20)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+        case .failed(let message):
+            VStack(spacing: 10) {
+                Text("Could not load editable blocks")
+                    .font(.headline)
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(20)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+        case .loaded:
+            EmptyView()
+        }
     }
 }
 
@@ -240,8 +310,29 @@ private struct InspectorView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Current Page")
                             .font(.headline)
+                        Text(session.currentPageLoadState.displayName)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(pageLoadColor(for: session.currentPageLoadState))
+                        if let loadFailure = session.currentPageLoadState.failureMessage {
+                            Text(loadFailure)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                         ForEach(report.issues) { issue in
                             Text(issue.message)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } else {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Current Page")
+                            .font(.headline)
+                        Text(session.currentPageLoadState.displayName)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(pageLoadColor(for: session.currentPageLoadState))
+                        if let loadFailure = session.currentPageLoadState.failureMessage {
+                            Text(loadFailure)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -260,6 +351,17 @@ private struct InspectorView: View {
             return .orange
         case .blocked:
             return .secondary
+        }
+    }
+
+    private func pageLoadColor(for state: PageBlockLoadState) -> Color {
+        switch state {
+        case .loaded:
+            return .green
+        case .unloaded, .loading:
+            return .orange
+        case .failed:
+            return .red
         }
     }
 }
