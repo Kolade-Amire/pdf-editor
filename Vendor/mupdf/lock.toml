@@ -1,5 +1,5 @@
 schema_version = 1
-mirror_repo = "UNSET"
+mirror_repo = "https://github.com/Kolade-Amire/pdf-editor-mupdf-mirror"
 upstream_commit = "d237b318e7b6e9e2c0c295f43a60910c8241ed78"
 release_tag = "mupdf-d237b318"
 build_extract = "no"
@@ -7,10 +7,10 @@ build_tesseract = "no"
 
 [source]
 archive_name = "mupdf-d237b318-source.tar.gz"
-url = "UNSET"
-sha256 = "UNSET"
+url = "https://github.com/Kolade-Amire/pdf-editor-mupdf-mirror/releases/download/mupdf-d237b318/mupdf-d237b318-source.tar.gz"
+sha256 = "9cf71af58317e28cbc623a1e4e00232101f869eebab9425bd4a21ead077623bb"
 
 [macos_arm64_build]
 archive_name = "mupdf-d237b318-macos-arm64-build.tar.gz"
-url = "UNSET"
-sha256 = "UNSET"
+url = "https://github.com/Kolade-Amire/pdf-editor-mupdf-mirror/releases/download/mupdf-d237b318/mupdf-d237b318-macos-arm64-build.tar.gz"
+sha256 = "3160c77a5a1b2f53cd1e0b70a90dcd88a31dbab6cc34bf45d66c240e0e23bfe1"

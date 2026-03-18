@@ -21,3 +21,5 @@ DerivedData/
 *.swp
 *.swo
 *~
+
+.idea
