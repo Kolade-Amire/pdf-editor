@@ -78,7 +78,3 @@ Expected results:
 - `Vendor/mupdf/`: MuPDF lock file plus ignored local build/source caches.
 - `MirrorBootstrap/mupdf-mirror-template/`: bootstrap template for the separate MuPDF mirror repo and its release workflow.
 - `Tests/PdfEditorCoreTests/`: unit tests covering block staging, read-only rejection, and save-time fit validation.
-
-## Next step for true inline PDF rewriting
-
-Implement the narrow MuPDF C bridge against the fetched artifacts so `MuPDFBridgeEngine` can open, render, extract structured text blocks, and write real content-stream overlays inside the original block bounds without using annotations.
