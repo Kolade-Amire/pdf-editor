@@ -52,6 +52,8 @@ final class DocumentSessionTests: XCTestCase {
 
         XCTAssertEqual(session.pageLoadState(for: 0), .loaded)
         XCTAssertEqual(session.pageLoadState(for: 1), .unloaded)
+        XCTAssertEqual(session.currentPageReport?.pageIndex, 0)
+        XCTAssertTrue(session.currentPageReport?.isEditable == true)
         XCTAssertEqual(session.pageBlocks[0]?.map(\.id), ["page-0-block"])
         XCTAssertNil(session.pageBlocks[1])
         XCTAssertEqual(engine.extractCallCountsByPage[0], 1)
@@ -128,6 +130,7 @@ final class DocumentSessionTests: XCTestCase {
 
         XCTAssertEqual(session.document?.descriptor.sourceURL, url)
         XCTAssertEqual(session.pageLoadState(for: 1), .failed(message: "Page 2 failed."))
+        XCTAssertNil(session.pageReport(for: 1))
         XCTAssertEqual(session.pageBlocks[1], [])
         XCTAssertEqual(engine.extractCallCountsByPage[1], 1)
     }
@@ -320,9 +323,10 @@ final class DocumentSessionTests: XCTestCase {
     }
 }
 
-private final class MockPDFEngine: PDFEngine {
+private final class MockPDFEngine: PDFEngine, PageAnalysisProvidingPDFEngine {
     var document: LoadedPDFDocument
     var blocksByPage: [Int: [EditableTextBlock]]
+    var pageReportsByPage: [Int: PageEditabilityReport]
     var extractCallCountsByPage: [Int: Int] = [:]
     var savedURLs: [URL] = []
     var saveAllowOverlayFallbackFlags: [Bool] = []
@@ -352,11 +356,14 @@ private final class MockPDFEngine: PDFEngine {
                 isLocked: false,
                 canEdit: isEditable,
                 isSigned: false,
-                backend: .muPDFEditable
+                backend: isEditable ? .muPDFEditable : .muPDFReadOnly
             ),
             editabilityReport: report
         )
         self.blocksByPage = blocksByPage
+        self.pageReportsByPage = Dictionary(
+            uniqueKeysWithValues: pageReports.map { ($0.pageIndex, $0) }
+        )
         self.preflightModesByBlockID = preflightModesByBlockID
         self.preflightMessagesByBlockID = preflightMessagesByBlockID
         self.pageExtractionErrors = pageExtractionErrors
@@ -375,13 +382,21 @@ private final class MockPDFEngine: PDFEngine {
     }
 
     func extractEditableBlocks(from document: LoadedPDFDocument, pageIndex: Int) throws -> [EditableTextBlock] {
+        try extractPageAnalysis(from: document, pageIndex: pageIndex).blocks
+    }
+
+    package func extractPageAnalysis(from document: LoadedPDFDocument, pageIndex: Int) throws -> PageAnalysisResult {
         extractCallCountsByPage[pageIndex, default: 0] += 1
 
         if let error = pageExtractionErrors[pageIndex] {
             throw error
         }
 
-        return blocksByPage[pageIndex] ?? []
+        return PageAnalysisResult(
+            blocks: blocksByPage[pageIndex] ?? [],
+            report: pageReportsByPage[pageIndex]
+                ?? PageEditabilityReport(pageIndex: pageIndex, isEditable: false, issues: [])
+        )
     }
 
     func applyEdits(_ edits: [TextEdit], to document: LoadedPDFDocument) throws {

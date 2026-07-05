@@ -256,6 +256,14 @@ int pdf_bridge_extract_blocks(
     char **out_error
 );
 
+int pdf_bridge_extract_blocks_with_report(
+    pdf_bridge_document *document,
+    int32_t page_index,
+    pdf_bridge_text_block_array *out_blocks,
+    pdf_bridge_page_report *out_page_report,
+    char **out_error
+);
+
 int pdf_bridge_save_document(
     pdf_bridge_document *document,
     const char *destination_path,
@@ -283,6 +291,7 @@ int pdf_bridge_validate_file(
 
 void pdf_bridge_free_document_info(pdf_bridge_document_info *info);
 void pdf_bridge_free_editability_report(pdf_bridge_editability_report *report);
+void pdf_bridge_free_page_report(pdf_bridge_page_report *report);
 void pdf_bridge_free_text_block_array(pdf_bridge_text_block_array *blocks);
 void pdf_bridge_free_rendered_page(pdf_bridge_rendered_page *page);
 void pdf_bridge_free_save_preflight_report(pdf_bridge_save_preflight_report *report);

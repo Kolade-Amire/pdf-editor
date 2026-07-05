@@ -4,11 +4,12 @@ import CoreGraphics
 import Foundation
 import PDFKit
 
-public final class PDFKitEngine: PDFEngine {
+public final class PDFKitEngine: PDFEngine, PageAnalysisProvidingPDFEngine {
     private final class Storage {
         var sourceURL: URL
         let document: PDFDocument
         var cachedBaseBlocks: [Int: [EditableTextBlock]] = [:]
+        var cachedPageReports: [Int: PageEditabilityReport] = [:]
 
         init(sourceURL: URL, document: PDFDocument) {
             self.sourceURL = sourceURL
@@ -38,7 +39,7 @@ public final class PDFKitEngine: PDFEngine {
         let storage = Storage(sourceURL: url, document: document)
         storageByID[identifier] = storage
 
-        let report = buildEditabilityReport(for: storage)
+        let report = buildOpenEditabilityReport(for: storage)
         let descriptor = makeDescriptor(for: storage, report: report)
         return LoadedPDFDocument(id: identifier, descriptor: descriptor, editabilityReport: report)
     }
@@ -52,7 +53,10 @@ public final class PDFKitEngine: PDFEngine {
             throw PDFEditorError.invalidPassword
         }
 
-        let report = buildEditabilityReport(for: storage)
+        storage.cachedBaseBlocks.removeAll()
+        storage.cachedPageReports.removeAll()
+
+        let report = buildOpenEditabilityReport(for: storage)
         let descriptor = makeDescriptor(for: storage, report: report)
         return LoadedPDFDocument(id: document.id, descriptor: descriptor, editabilityReport: report)
     }
@@ -94,24 +98,30 @@ public final class PDFKitEngine: PDFEngine {
     }
 
     public func extractEditableBlocks(from document: LoadedPDFDocument, pageIndex: Int) throws -> [EditableTextBlock] {
+        try extractPageAnalysis(from: document, pageIndex: pageIndex).blocks
+    }
+
+    package func extractPageAnalysis(from document: LoadedPDFDocument, pageIndex: Int) throws -> PageAnalysisResult {
         let storage = try storage(for: document)
         if storage.document.isLocked {
             throw PDFEditorError.passwordRequired
         }
 
-        if let cached = storage.cachedBaseBlocks[pageIndex] {
-            return cached
+        if let cachedBlocks = storage.cachedBaseBlocks[pageIndex],
+           let cachedReport = storage.cachedPageReports[pageIndex] {
+            return PageAnalysisResult(blocks: cachedBlocks, report: cachedReport)
         }
 
         let page = try page(for: document, pageIndex: pageIndex)
-        let pageReport = document.editabilityReport.pageReports.first(where: { $0.pageIndex == pageIndex })
+        let pageReport = makePageReport(for: page, pageIndex: pageIndex)
         let blocks = makeBlocks(
             for: page,
             pageIndex: pageIndex,
             pageReport: pageReport
         )
         storage.cachedBaseBlocks[pageIndex] = blocks
-        return blocks
+        storage.cachedPageReports[pageIndex] = pageReport
+        return PageAnalysisResult(blocks: blocks, report: pageReport)
     }
 
     public func applyEdits(_ edits: [TextEdit], to document: LoadedPDFDocument) throws {
@@ -188,7 +198,7 @@ public final class PDFKitEngine: PDFEngine {
         )
     }
 
-    private func buildEditabilityReport(for storage: Storage) -> EditabilityReport {
+    private func buildOpenEditabilityReport(for storage: Storage) -> EditabilityReport {
         let document = storage.document
         var documentIssues: [EditabilityIssue] = [
             EditabilityIssue(kind: .engineUnavailable, message: readOnlyReason)
@@ -203,39 +213,12 @@ public final class PDFKitEngine: PDFEngine {
             )
         }
 
-        var pageReports: [PageEditabilityReport] = []
-
-        for pageIndex in 0..<document.pageCount {
-            guard let page = document.page(at: pageIndex) else {
-                continue
-            }
-
-            let text = normalized(page.string ?? "")
-            var issues: [EditabilityIssue] = []
-
-            if text.isEmpty {
-                issues.append(
-                    EditabilityIssue(
-                        kind: .imageOnly,
-                        message: "Page \(pageIndex + 1) has no extractable digital text.",
-                        pageIndex: pageIndex
-                    )
-                )
-            }
-
-            pageReports.append(
-                PageEditabilityReport(
-                    pageIndex: pageIndex,
-                    isEditable: false,
-                    issues: issues
-                )
-            )
-        }
-
         return EditabilityReport(
             isEditable: false,
             issues: documentIssues,
-            pageReports: pageReports
+            pageReports: (0..<document.pageCount).map {
+                PageEditabilityReport(pageIndex: $0, isEditable: false, issues: [])
+            }
         )
     }
 
@@ -314,6 +297,29 @@ public final class PDFKitEngine: PDFEngine {
                 persistenceMessage: failureReason.message
             )
         }
+    }
+
+    private func makePageReport(for page: PDFPage, pageIndex: Int) -> PageEditabilityReport {
+        let text = normalized(page.string ?? "")
+        let issues: [EditabilityIssue]
+
+        if text.isEmpty {
+            issues = [
+                EditabilityIssue(
+                    kind: .imageOnly,
+                    message: "Page \(pageIndex + 1) has no extractable digital text.",
+                    pageIndex: pageIndex
+                )
+            ]
+        } else {
+            issues = []
+        }
+
+        return PageEditabilityReport(
+            pageIndex: pageIndex,
+            isEditable: false,
+            issues: issues
+        )
     }
 
     private func storage(for document: LoadedPDFDocument) throws -> Storage {

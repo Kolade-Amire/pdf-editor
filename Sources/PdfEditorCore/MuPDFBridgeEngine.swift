@@ -2,16 +2,22 @@ import CPdfEngineBridge
 import CoreGraphics
 import Foundation
 
-public final class MuPDFBridgeEngine: PDFEngine {
+public final class MuPDFBridgeEngine: PDFEngine, PageAnalysisProvidingPDFEngine {
     private struct NativeBlockReference {
         let pageIndex: Int
         let nativeBlockID: Int32
+    }
+
+    private struct NativePageAnalysis {
+        let blocks: [EditableTextBlock]
+        let report: PageEditabilityReport
     }
 
     private final class Storage {
         var sourceURL: URL
         let handle: OpaquePointer
         var cachedBaseBlocks: [Int: [EditableTextBlock]] = [:]
+        var cachedPageReports: [Int: PageEditabilityReport] = [:]
         var blockReferencesByID: [String: NativeBlockReference] = [:]
         var pendingEditsByBlockID: [String: TextEdit] = [:]
 
@@ -116,6 +122,7 @@ public final class MuPDFBridgeEngine: PDFEngine {
         }
 
         storage.cachedBaseBlocks.removeAll()
+        storage.cachedPageReports.removeAll()
         storage.blockReferencesByID.removeAll()
         storage.pendingEditsByBlockID.removeAll()
 
@@ -187,11 +194,18 @@ public final class MuPDFBridgeEngine: PDFEngine {
     }
 
     public func extractEditableBlocks(from document: LoadedPDFDocument, pageIndex: Int) throws -> [EditableTextBlock] {
+        try extractPageAnalysis(from: document, pageIndex: pageIndex).blocks
+    }
+
+    package func extractPageAnalysis(from document: LoadedPDFDocument, pageIndex: Int) throws -> PageAnalysisResult {
         let storage = try storage(for: document)
         try validatePageIndex(pageIndex, in: document)
 
-        let baseBlocks = try loadBaseBlocks(forPage: pageIndex, in: storage, document: document)
-        return overlayPendingEdits(on: baseBlocks, pendingEdits: storage.pendingEditsByBlockID)
+        let analysis = try loadPageAnalysis(forPage: pageIndex, in: storage, document: document)
+        return PageAnalysisResult(
+            blocks: overlayPendingEdits(on: analysis.blocks, pendingEdits: storage.pendingEditsByBlockID),
+            report: analysis.report
+        )
     }
 
     public func applyEdits(_ edits: [TextEdit], to document: LoadedPDFDocument) throws {
@@ -417,27 +431,33 @@ public final class MuPDFBridgeEngine: PDFEngine {
         }
     }
 
-    private func loadBaseBlocks(
+    private func loadPageAnalysis(
         forPage pageIndex: Int,
         in storage: Storage,
         document: LoadedPDFDocument
-    ) throws -> [EditableTextBlock] {
-        if let cachedBlocks = storage.cachedBaseBlocks[pageIndex] {
-            return cachedBlocks
+    ) throws -> NativePageAnalysis {
+        if let cachedBlocks = storage.cachedBaseBlocks[pageIndex],
+           let cachedReport = storage.cachedPageReports[pageIndex] {
+            return NativePageAnalysis(blocks: cachedBlocks, report: cachedReport)
         }
 
         var nativeBlocks = pdf_bridge_text_block_array()
+        var nativePageReport = pdf_bridge_page_report()
         var errorMessage: UnsafeMutablePointer<CChar>?
 
-        let didExtract = pdf_bridge_extract_blocks(
+        let didExtract = pdf_bridge_extract_blocks_with_report(
             storage.handle,
             Int32(pageIndex),
             &nativeBlocks,
+            &nativePageReport,
             &errorMessage
         ) != 0
 
         guard didExtract else {
-            defer { pdf_bridge_free_text_block_array(&nativeBlocks) }
+            defer {
+                pdf_bridge_free_text_block_array(&nativeBlocks)
+                pdf_bridge_free_page_report(&nativePageReport)
+            }
             let message = takeBridgeError(errorMessage) ?? "MuPDF could not extract text blocks for page \(pageIndex + 1)."
             if message.localizedCaseInsensitiveContains("password") {
                 throw PDFEditorError.passwordRequired
@@ -445,11 +465,20 @@ public final class MuPDFBridgeEngine: PDFEngine {
             throw PDFEditorError.saveFailed(message)
         }
 
-        defer { pdf_bridge_free_text_block_array(&nativeBlocks) }
+        defer {
+            pdf_bridge_free_text_block_array(&nativeBlocks)
+            pdf_bridge_free_page_report(&nativePageReport)
+        }
 
         let blocks = mapTextBlocks(nativeBlocks, document: document, storage: storage)
+        let report = PageEditabilityReport(
+            pageIndex: Int(nativePageReport.page_index),
+            isEditable: nativePageReport.is_editable,
+            issues: bufferPointer(start: nativePageReport.issues, count: Int(nativePageReport.issue_count)).map(mapIssue)
+        )
         storage.cachedBaseBlocks[pageIndex] = blocks
-        return blocks
+        storage.cachedPageReports[pageIndex] = report
+        return NativePageAnalysis(blocks: blocks, report: report)
     }
 
     private func resolveBlock(
@@ -462,7 +491,7 @@ public final class MuPDFBridgeEngine: PDFEngine {
         }
 
         for pageIndex in 0..<document.descriptor.pageCount {
-            let pageBlocks = try loadBaseBlocks(forPage: pageIndex, in: storage, document: document)
+            let pageBlocks = try loadPageAnalysis(forPage: pageIndex, in: storage, document: document).blocks
             if let block = pageBlocks.first(where: { $0.id == blockID }) {
                 return overlayPendingEdit(on: block, pendingEdits: storage.pendingEditsByBlockID)
             }

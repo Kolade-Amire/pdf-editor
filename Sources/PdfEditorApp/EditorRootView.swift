@@ -8,7 +8,14 @@ struct EditorRootView: View {
     var body: some View {
         Group {
             if appState.session.document == nil {
-                EmptyStateView(openAction: appState.openDocument)
+                if let openingURL = appState.openingDocumentURL {
+                    OpeningStateView(fileName: openingURL.lastPathComponent)
+                } else {
+                    EmptyStateView(
+                        openAction: appState.openDocument,
+                        isOpeningDocument: appState.isOpeningDocument
+                    )
+                }
             } else {
                 NavigationSplitView {
                     SidebarView(session: appState.session)
@@ -26,6 +33,7 @@ struct EditorRootView: View {
                 Button("Open PDF…") {
                     appState.openDocument()
                 }
+                .disabled(appState.isOpeningDocument)
 
                 Button("Save") {
                     appState.saveDocument()
@@ -79,6 +87,7 @@ struct EditorRootView: View {
 
 private struct EmptyStateView: View {
     let openAction: () -> Void
+    let isOpeningDocument: Bool
 
     var body: some View {
         VStack(spacing: 16) {
@@ -88,6 +97,26 @@ private struct EmptyStateView: View {
                 .foregroundStyle(.secondary)
             Button("Open PDF…", action: openAction)
                 .buttonStyle(.borderedProminent)
+                .disabled(isOpeningDocument)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(24)
+    }
+}
+
+private struct OpeningStateView: View {
+    let fileName: String
+
+    var body: some View {
+        VStack(spacing: 16) {
+            ProgressView()
+                .controlSize(.large)
+            Text("Opening PDF…")
+                .font(.largeTitle.bold())
+            Text(fileName)
+                .font(.headline)
+            Text("Reading document metadata and preparing the first page.")
+                .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(24)
@@ -105,16 +134,43 @@ private struct SidebarView: View {
             ForEach(0..<session.pageCount, id: \.self) { pageIndex in
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Page \(pageIndex + 1)")
-                    if let report = session.document?.editabilityReport.pageReports.first(where: { $0.pageIndex == pageIndex }) {
-                        Text(report.isEditable ? "Editable" : "Read-only")
-                            .font(.caption)
-                            .foregroundStyle(report.isEditable ? Color.green : Color.secondary)
-                    }
+                    Text(statusText(for: pageIndex))
+                        .font(.caption)
+                        .foregroundStyle(statusColor(for: pageIndex))
                 }
                 .tag(pageIndex)
             }
         }
         .navigationTitle(session.document?.descriptor.title ?? session.document?.descriptor.sourceURL.lastPathComponent ?? "PDF")
+    }
+
+    private func statusText(for pageIndex: Int) -> String {
+        switch session.pageLoadState(for: pageIndex) {
+        case .unloaded:
+            return "Not analyzed"
+        case .loading:
+            return "Loading"
+        case .failed:
+            return "Load failed"
+        case .loaded:
+            guard let report = session.pageReport(for: pageIndex) else {
+                return "Read-only"
+            }
+            return report.isEditable ? "Editable" : "Read-only"
+        }
+    }
+
+    private func statusColor(for pageIndex: Int) -> Color {
+        switch session.pageLoadState(for: pageIndex) {
+        case .unloaded:
+            return .secondary
+        case .loading:
+            return .orange
+        case .failed:
+            return .red
+        case .loaded:
+            return session.pageReport(for: pageIndex)?.isEditable == true ? .green : .secondary
+        }
     }
 }
 
@@ -310,9 +366,9 @@ private struct InspectorView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Current Page")
                             .font(.headline)
-                        Text(session.currentPageLoadState.displayName)
+                        Text(currentPageStatusText)
                             .font(.caption.weight(.semibold))
-                            .foregroundStyle(pageLoadColor(for: session.currentPageLoadState))
+                            .foregroundStyle(currentPageStatusColor)
                         if let loadFailure = session.currentPageLoadState.failureMessage {
                             Text(loadFailure)
                                 .font(.caption)
@@ -328,9 +384,9 @@ private struct InspectorView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Current Page")
                             .font(.headline)
-                        Text(session.currentPageLoadState.displayName)
+                        Text(currentPageStatusText)
                             .font(.caption.weight(.semibold))
-                            .foregroundStyle(pageLoadColor(for: session.currentPageLoadState))
+                            .foregroundStyle(currentPageStatusColor)
                         if let loadFailure = session.currentPageLoadState.failureMessage {
                             Text(loadFailure)
                                 .font(.caption)
@@ -354,10 +410,23 @@ private struct InspectorView: View {
         }
     }
 
-    private func pageLoadColor(for state: PageBlockLoadState) -> Color {
-        switch state {
+    private var currentPageStatusText: String {
+        switch session.currentPageLoadState {
+        case .unloaded:
+            return "Not analyzed"
+        case .loading:
+            return "Loading"
+        case .failed:
+            return "Load failed"
         case .loaded:
-            return .green
+            return session.currentPageReport?.isEditable == true ? "Editable" : "Read-only"
+        }
+    }
+
+    private var currentPageStatusColor: Color {
+        switch session.currentPageLoadState {
+        case .loaded:
+            return session.currentPageReport?.isEditable == true ? .green : .secondary
         case .unloaded, .loading:
             return .orange
         case .failed:

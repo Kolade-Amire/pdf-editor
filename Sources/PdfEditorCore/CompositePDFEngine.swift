@@ -1,7 +1,7 @@
 import CoreGraphics
 import Foundation
 
-public final class CompositePDFEngine: PDFEngine {
+public final class CompositePDFEngine: PDFEngine, PageAnalysisProvidingPDFEngine {
     private let muPDFEngine: MuPDFBridgeEngine
     private var engineByDocumentID: [UUID: PDFEngine] = [:]
 
@@ -44,8 +44,7 @@ public final class CompositePDFEngine: PDFEngine {
     }
 
     public func extractEditableBlocks(from document: LoadedPDFDocument, pageIndex: Int) throws -> [EditableTextBlock] {
-        let engine = try engine(for: document)
-        return try engine.extractEditableBlocks(from: document, pageIndex: pageIndex)
+        try extractPageAnalysis(from: document, pageIndex: pageIndex).blocks
     }
 
     public func extractEditableRuns(from document: LoadedPDFDocument, pageIndex: Int) throws -> [EditableTextRun] {
@@ -79,6 +78,24 @@ public final class CompositePDFEngine: PDFEngine {
         }
 
         return try PDFKitEngine().validate(fileURL)
+    }
+
+    package func extractPageAnalysis(from document: LoadedPDFDocument, pageIndex: Int) throws -> PageAnalysisResult {
+        let engine = try engine(for: document)
+
+        if let pageAnalysisEngine = engine as? any PageAnalysisProvidingPDFEngine {
+            return try pageAnalysisEngine.extractPageAnalysis(from: document, pageIndex: pageIndex)
+        }
+
+        let blocks = try engine.extractEditableBlocks(from: document, pageIndex: pageIndex)
+        return PageAnalysisResult(
+            blocks: blocks,
+            report: PageEditabilityReport(
+                pageIndex: pageIndex,
+                isEditable: blocks.contains(where: \.isEditable),
+                issues: blocks.compactMap(\.failureReason)
+            )
+        )
     }
 
     private func engine(for document: LoadedPDFDocument) throws -> PDFEngine {

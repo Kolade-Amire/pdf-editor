@@ -425,7 +425,7 @@ package enum PageBlockLoadState: Hashable, Sendable {
     package var displayName: String {
         switch self {
         case .unloaded:
-            "Not loaded"
+            "Not analyzed"
         case .loading:
             "Loading editable blocks"
         case .loaded:

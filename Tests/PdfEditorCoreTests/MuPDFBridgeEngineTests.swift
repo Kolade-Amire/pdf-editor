@@ -32,6 +32,8 @@ final class MuPDFBridgeEngineTests: XCTestCase {
 
         XCTAssertEqual(document.descriptor.backend, .muPDFEditable)
         XCTAssertTrue(document.editabilityReport.isEditable)
+        XCTAssertEqual(document.editabilityReport.pageReports.count, 1)
+        XCTAssertTrue(document.editabilityReport.pageReports.allSatisfy { !$0.isEditable && $0.issues.isEmpty })
 
         let image = try engine.renderPage(of: document, pageIndex: 0, scale: 2)
         XCTAssertGreaterThan(image.width, 0)
@@ -135,12 +137,10 @@ final class MuPDFBridgeEngineTests: XCTestCase {
 
         let engine = MuPDFBridgeEngine(validationBinaryURL: nil)
         let document = try engine.open(url: sourceURL)
+        let analysis = try engine.extractPageAnalysis(from: document, pageIndex: 0)
 
-        XCTAssertFalse(document.editabilityReport.isEditable)
-
-        let pageReport = try XCTUnwrap(document.editabilityReport.pageReports.first(where: { $0.pageIndex == 0 }))
-        XCTAssertFalse(pageReport.isEditable)
-        XCTAssertTrue(pageReport.issues.contains(where: { $0.kind == .unsupportedTransform }))
+        XCTAssertFalse(analysis.report.isEditable)
+        XCTAssertTrue(analysis.report.issues.contains(where: { $0.kind == .unsupportedTransform }))
 
         let blocks = try engine.extractEditableBlocks(from: document, pageIndex: 0)
         let block = try XCTUnwrap(blocks.first)
@@ -164,12 +164,10 @@ final class MuPDFBridgeEngineTests: XCTestCase {
 
         let engine = MuPDFBridgeEngine(validationBinaryURL: nil)
         let document = try engine.open(url: sourceURL)
+        let analysis = try engine.extractPageAnalysis(from: document, pageIndex: 0)
 
-        XCTAssertFalse(document.editabilityReport.isEditable)
-
-        let pageReport = try XCTUnwrap(document.editabilityReport.pageReports.first(where: { $0.pageIndex == 0 }))
-        XCTAssertFalse(pageReport.isEditable)
-        XCTAssertTrue(pageReport.issues.contains(where: { $0.kind == .imageOnly }))
+        XCTAssertFalse(analysis.report.isEditable)
+        XCTAssertTrue(analysis.report.issues.contains(where: { $0.kind == .imageOnly }))
 
         let blocks = try engine.extractEditableBlocks(from: document, pageIndex: 0)
         XCTAssertTrue(blocks.isEmpty)

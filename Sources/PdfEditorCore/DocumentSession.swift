@@ -6,6 +6,7 @@ import Foundation
 public final class DocumentSession: ObservableObject {
     @Published public private(set) var document: LoadedPDFDocument?
     @Published public private(set) var pageBlocks: [Int: [EditableTextBlock]] = [:]
+    @Published package private(set) var pageReportsByIndex: [Int: PageEditabilityReport] = [:]
     @Published package private(set) var pageLoadStates: [Int: PageBlockLoadState] = [:]
     @Published public private(set) var pendingEdits: [String: TextEdit] = [:]
     @Published public private(set) var selectedBlockID: String?
@@ -68,7 +69,7 @@ public final class DocumentSession: ObservableObject {
     }
 
     public var currentPageReport: PageEditabilityReport? {
-        document?.editabilityReport.pageReports.first(where: { $0.pageIndex == currentPageIndex })
+        pageReport(for: currentPageIndex)
     }
 
     public var documentIssues: [EditabilityIssue] {
@@ -87,7 +88,7 @@ public final class DocumentSession: ObservableObject {
         let openedDocument = try engine.open(url: url)
         document = openedDocument
         requiresPassword = openedDocument.descriptor.isLocked
-        isReadOnly = !openedDocument.editabilityReport.isEditable
+        isReadOnly = !openedDocument.descriptor.backend.supportsWrites
         currentPageIndex = 0
         pendingEdits = [:]
         selectedBlockID = nil
@@ -97,6 +98,7 @@ public final class DocumentSession: ObservableObject {
         pendingSavePreflight = nil
         statusMessage = nil
         pageBlocks = [:]
+        pageReportsByIndex = [:]
         pageLoadStates = [:]
     }
 
@@ -108,8 +110,9 @@ public final class DocumentSession: ObservableObject {
         let unlockedDocument = try engine.unlock(document, password: password)
         self.document = unlockedDocument
         requiresPassword = unlockedDocument.descriptor.isLocked
-        isReadOnly = !unlockedDocument.editabilityReport.isEditable
+        isReadOnly = !unlockedDocument.descriptor.backend.supportsWrites
         pageBlocks = [:]
+        pageReportsByIndex = [:]
         pageLoadStates = [:]
         selectedBlockID = nil
         selectedRunID = nil
@@ -126,6 +129,10 @@ public final class DocumentSession: ObservableObject {
 
     package func pageLoadState(for pageIndex: Int) -> PageBlockLoadState {
         pageLoadStates[pageIndex] ?? .unloaded
+    }
+
+    package func pageReport(for pageIndex: Int) -> PageEditabilityReport? {
+        pageReportsByIndex[pageIndex]
     }
 
     public func runs(for pageIndex: Int) -> [EditableTextRun] {
@@ -325,15 +332,52 @@ public final class DocumentSession: ObservableObject {
         pageLoadStates[pageIndex] = .loading
 
         do {
-            pageBlocks[pageIndex] = try engine.extractEditableBlocks(from: document, pageIndex: pageIndex)
+            let analysis = try pageAnalysis(for: document, pageIndex: pageIndex)
+            pageBlocks[pageIndex] = analysis.blocks
+            pageReportsByIndex[pageIndex] = analysis.report
             pageLoadStates[pageIndex] = .loaded
             syncSelectionAfterPageRefresh(pageIndex: pageIndex)
             return
         } catch {
             pageBlocks[pageIndex] = []
+            pageReportsByIndex.removeValue(forKey: pageIndex)
             pageLoadStates[pageIndex] = .failed(message: error.localizedDescription)
             clearSelectionIfNeeded(for: pageIndex)
         }
+    }
+
+    private func pageAnalysis(for document: LoadedPDFDocument, pageIndex: Int) throws -> PageAnalysisResult {
+        if let pageAnalysisEngine = engine as? any PageAnalysisProvidingPDFEngine {
+            return try pageAnalysisEngine.extractPageAnalysis(from: document, pageIndex: pageIndex)
+        }
+
+        let blocks = try engine.extractEditableBlocks(from: document, pageIndex: pageIndex)
+        return PageAnalysisResult(
+            blocks: blocks,
+            report: synthesizePageReport(for: pageIndex, blocks: blocks)
+        )
+    }
+
+    private func synthesizePageReport(for pageIndex: Int, blocks: [EditableTextBlock]) -> PageEditabilityReport {
+        if blocks.isEmpty {
+            return PageEditabilityReport(
+                pageIndex: pageIndex,
+                isEditable: false,
+                issues: [
+                    EditabilityIssue(
+                        kind: .imageOnly,
+                        message: "Page \(pageIndex + 1) has no extractable digital text.",
+                        pageIndex: pageIndex
+                    )
+                ]
+            )
+        }
+
+        return PageEditabilityReport(
+            pageIndex: pageIndex,
+            isEditable: blocks.contains(where: \.isEditable),
+            issues: blocks.compactMap(\.failureReason)
+        )
     }
 
     private func syncSelectionAfterPageRefresh(pageIndex: Int) {

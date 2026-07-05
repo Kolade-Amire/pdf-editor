@@ -15,6 +15,7 @@ final class AppState: ObservableObject {
     @Published var session: DocumentSession
     @Published var errorMessage: String?
     @Published var overlaySaveRequest: OverlaySaveRequest?
+    @Published var openingDocumentURL: URL?
 
     init(session: DocumentSession = DocumentSession()) {
         self.session = session
@@ -22,6 +23,10 @@ final class AppState: ObservableObject {
 
     var loadedURL: URL? {
         session.document?.descriptor.sourceURL
+    }
+
+    var isOpeningDocument: Bool {
+        openingDocumentURL != nil
     }
 
     func openDocument() {
@@ -34,10 +39,25 @@ final class AppState: ObservableObject {
             return
         }
 
-        do {
-            try session.load(url: url)
-        } catch {
-            errorMessage = error.localizedDescription
+        errorMessage = nil
+        openingDocumentURL = url
+
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+
+            await Task.yield()
+
+            do {
+                try session.load(url: url)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+
+            if openingDocumentURL == url {
+                openingDocumentURL = nil
+            }
         }
     }
 

@@ -18,6 +18,20 @@ public protocol PDFEngine: AnyObject {
     func validate(_ fileURL: URL) throws -> ValidationReport
 }
 
+package struct PageAnalysisResult: Sendable {
+    package let blocks: [EditableTextBlock]
+    package let report: PageEditabilityReport
+
+    package init(blocks: [EditableTextBlock], report: PageEditabilityReport) {
+        self.blocks = blocks
+        self.report = report
+    }
+}
+
+package protocol PageAnalysisProvidingPDFEngine: PDFEngine {
+    func extractPageAnalysis(from document: LoadedPDFDocument, pageIndex: Int) throws -> PageAnalysisResult
+}
+
 public extension PDFEngine {
     func extractEditableRuns(from document: LoadedPDFDocument, pageIndex: Int) throws -> [EditableTextRun] {
         try extractEditableBlocks(from: document, pageIndex: pageIndex)

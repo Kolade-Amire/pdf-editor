@@ -400,6 +400,13 @@ static void bridge_zero_editability_report(pdf_bridge_editability_report *report
     }
 }
 
+static void bridge_zero_page_report(pdf_bridge_page_report *report)
+{
+    if (report != NULL) {
+        memset(report, 0, sizeof(*report));
+    }
+}
+
 static void bridge_zero_block_array(pdf_bridge_text_block_array *blocks)
 {
     if (blocks != NULL) {
@@ -1331,7 +1338,7 @@ static int bridge_fill_document_info(fz_context *ctx, pdf_bridge_document *docum
     return 1;
 }
 
-static int bridge_build_editability_report(
+static int bridge_build_open_editability_report(
     fz_context *ctx,
     pdf_bridge_document *document,
     pdf_bridge_editability_report *out_report
@@ -1339,7 +1346,7 @@ static int bridge_build_editability_report(
 {
     int page_count;
     int page_index;
-    bool has_editable_page = false;
+    bool can_edit;
 
     bridge_zero_editability_report(out_report);
 
@@ -1364,19 +1371,13 @@ static int bridge_build_editability_report(
     }
 
     for (page_index = 0; page_index < page_count; page_index++) {
-        pdf_bridge_text_block_array ignored_blocks;
-        bridge_zero_block_array(&ignored_blocks);
-
-        if (!bridge_collect_page_blocks(ctx, document, page_index, &ignored_blocks, &out_report->page_reports[page_index])) {
-            pdf_bridge_free_text_block_array(&ignored_blocks);
-            return 0;
-        }
-
-        has_editable_page = has_editable_page || out_report->page_reports[page_index].is_editable;
-        pdf_bridge_free_text_block_array(&ignored_blocks);
+        bridge_zero_page_report(&out_report->page_reports[page_index]);
+        out_report->page_reports[page_index].page_index = page_index;
+        out_report->page_reports[page_index].is_editable = false;
     }
 
-    out_report->is_editable = bridge_document_allows_editing(ctx, document) && has_editable_page;
+    can_edit = bridge_document_allows_editing(ctx, document);
+    out_report->is_editable = can_edit;
     return 1;
 }
 
@@ -2872,7 +2873,7 @@ int pdf_bridge_open_document(
     fz_try(document->ctx)
     {
         if (!bridge_fill_document_info(document->ctx, document, out_info) ||
-            !bridge_build_editability_report(document->ctx, document, out_report)) {
+            !bridge_build_open_editability_report(document->ctx, document, out_report)) {
             fz_throw(document->ctx, FZ_ERROR_SYSTEM, "Failed to build MuPDF document metadata.");
         }
     }
@@ -2907,7 +2908,7 @@ int pdf_bridge_unlock_document(
         }
 
         if (!bridge_fill_document_info(document->ctx, document, out_info) ||
-            !bridge_build_editability_report(document->ctx, document, out_report)) {
+            !bridge_build_open_editability_report(document->ctx, document, out_report)) {
             fz_throw(document->ctx, FZ_ERROR_SYSTEM, "Failed to rebuild editability after unlocking.");
         }
     }
@@ -3014,8 +3015,27 @@ int pdf_bridge_extract_blocks(
 )
 {
     pdf_bridge_page_report ignored_page_report;
-    memset(&ignored_page_report, 0, sizeof(ignored_page_report));
+    bridge_zero_page_report(&ignored_page_report);
+
+    if (!pdf_bridge_extract_blocks_with_report(document, page_index, out_blocks, &ignored_page_report, out_error)) {
+        pdf_bridge_free_page_report(&ignored_page_report);
+        return 0;
+    }
+
+    pdf_bridge_free_page_report(&ignored_page_report);
+    return 1;
+}
+
+int pdf_bridge_extract_blocks_with_report(
+    pdf_bridge_document *document,
+    int32_t page_index,
+    pdf_bridge_text_block_array *out_blocks,
+    pdf_bridge_page_report *out_page_report,
+    char **out_error
+)
+{
     bridge_zero_block_array(out_blocks);
+    bridge_zero_page_report(out_page_report);
 
     if (fz_needs_password(document->ctx, document->document)) {
         bridge_set_error(out_error, "This PDF requires a password before text blocks can be extracted.");
@@ -3024,22 +3044,15 @@ int pdf_bridge_extract_blocks(
 
     fz_try(document->ctx)
     {
-        if (!bridge_collect_page_blocks(document->ctx, document, page_index, out_blocks, &ignored_page_report)) {
+        if (!bridge_collect_page_blocks(document->ctx, document, page_index, out_blocks, out_page_report)) {
             fz_throw(document->ctx, FZ_ERROR_SYSTEM, "Failed to extract MuPDF text blocks.");
         }
-    }
-    fz_always(document->ctx)
-    {
-        size_t issue_index;
-        for (issue_index = 0; issue_index < ignored_page_report.issue_count; issue_index++) {
-            bridge_free_issue(&ignored_page_report.issues[issue_index]);
-        }
-        free(ignored_page_report.issues);
     }
     fz_catch(document->ctx)
     {
         bridge_set_mupdf_error(document->ctx, out_error, "Failed to extract page blocks");
         pdf_bridge_free_text_block_array(out_blocks);
+        pdf_bridge_free_page_report(out_page_report);
         return 0;
     }
 
@@ -3420,13 +3433,25 @@ void pdf_bridge_free_editability_report(pdf_bridge_editability_report *report)
     free(report->issues);
 
     for (page_index = 0; page_index < report->page_report_count; page_index++) {
-        pdf_bridge_page_report *page_report = &report->page_reports[page_index];
-        for (issue_index = 0; issue_index < page_report->issue_count; issue_index++) {
-            bridge_free_issue(&page_report->issues[issue_index]);
-        }
-        free(page_report->issues);
+        pdf_bridge_free_page_report(&report->page_reports[page_index]);
     }
     free(report->page_reports);
+    memset(report, 0, sizeof(*report));
+}
+
+void pdf_bridge_free_page_report(pdf_bridge_page_report *report)
+{
+    size_t issue_index;
+
+    if (report == NULL) {
+        return;
+    }
+
+    for (issue_index = 0; issue_index < report->issue_count; issue_index++) {
+        bridge_free_issue(&report->issues[issue_index]);
+    }
+
+    free(report->issues);
     memset(report, 0, sizeof(*report));
 }
 
